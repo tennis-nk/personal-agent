@@ -170,6 +170,11 @@ export function ImportTimetableDialog({ open, busy = false, onCancel, onImport }
       setImageUrl(preview)
       const dataUrl = await fileToDataUrl(file)
       const result = await recognizeTimetable(dataUrl)
+      // 读空了就别往文本框里塞空串，更别把上一次的内容当成这次的识别结果。
+      if (result.empty || !result.text.trim()) {
+        setOcrNote({ text: result.note, kind: 'error' })
+        return
+      }
       setText((prev) => (prev.trim() ? `${prev.trim()}\n${result.text}` : result.text))
       setOcrNote({ text: result.note, kind: 'ok' })
     } catch (error) {
@@ -291,7 +296,7 @@ export function ImportTimetableDialog({ open, busy = false, onCancel, onImport }
               event.preventDefault()
               void handleImage(file)
             }}
-            placeholder={SAMPLE}
+            placeholder="把课表贴在这里，或点上面的「识别课表图片」。想看格式就点「填入示例」，那会真的填进内容，不是灰字提示。"
           />
 
           <div className="row wrap" style={{ margin: '12px 0' }}>

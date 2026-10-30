@@ -9,19 +9,26 @@
 
 import { visionChat } from '../ai/llm'
 import { isReady, loadSettings, resolveVision, type LlmSettings } from '../ai/settings'
+import { parseTimetable } from './parse'
 
-/** 超过这个边长就缩一缩，省 token 也省时间；课表字不小，缩到 1600 仍然清楚。 */
-const MAX_SIDE = 1600
+/**
+ * 超过这个边长就缩一缩，省 token 也省时间。
+ * 教务系统的课表截图字很小、格子很密，缩到 1600 常常糊成一片，
+ * 模型只能回一句「看不清」，所以放宽到 2200。
+ */
+const MAX_SIDE = 2200
 
-export const TIMETABLE_PROMPT = `这是一张课程表的截图。请把它读成纯文本表格，直接输出，不要任何解释、不要代码块标记。
+const TIMETABLE_PROMPT = `这是一张课程表的截图。请把它读成纯文本表格，直接输出，不要任何解释、不要代码块标记。
 
 输出规则：
-1. 每行一门课，六个字段用 Tab 分隔，顺序固定为：课程名称、星期、节次、周次、上课地点、教师。
-2. 第一行的表头就写：课程名称	星期	节次	周次	地点	教师
+1. 每行一门课，六个字段用 Tab 分隔，顺序固定为：课程名称、星期、节次、周次、地点、教师。
+2. 第一行的表头就写：课程名称\t星期\t节次\t周次\t地点\t教师
 3. 星期写「周一」到「周日」；节次写「1-2」这种，只上一节就写「3」；周次写「1-16」「3-8」「1-15单」这种；看不清的字段留空。
 4. 同一门课在一周里上多次、或分单双周上，各占一行，不要合并。
 5. 如果图片里有「第一周」「开学」对应的日期，在第一行前面加一行：# 第一周 2026-09-07（日期换成图上那个）。
-6. 如果这张图不是课程表，只输出一行：NOT_TIMETABLE`
+6. 如果这张图不是课程表，只输出一行：NOT_TIMETABLE。
+7. 只要图里能看出课程格子就照实输出，字段看不清就留空，**不要**写「看不清」「无法识别」这类话代替数据行。`
+
 
 /** 图片转成 data URL，顺手压一下体积。 */
 export async function fileToDataUrl(file: File, maxSide = MAX_SIDE): Promise<string> {
@@ -118,6 +125,8 @@ export function normalizeVisionText(raw: string): string {
   for (const line of text.split('\n')) {
     let value = line.trim()
     if (!value) continue
+    // 模型偶尔把整段包在 ``` 里，开头那层上面已经削过，行内的围栏也得当空行跳过。
+    if (/^`{3,}/.test(value)) continue
 
     // Markdown 表格：| 高等数学 | 周一 | 1-2 | ... |
     if (value.startsWith('|')) {
@@ -150,6 +159,36 @@ export interface OcrResult {
   text: string
   /** 给界面显示的一句话，比如识别了几行。 */
   note: string
+  /** 一条课都没读出来时为 true，调用方别把空结果当成成功。 */
+  empty: boolean
+  /** 模型原话，只在读失败时用来排查（截断过）。 */
+  raw: string
+}
+
+/** 把模型原话压成一行，用作错误提示里的证据。 */
+function excerpt(raw: string, limit = 160): string {
+  const oneLine = raw.replace(/\s+/g, ' ').trim()
+  if (!oneLine) return ''
+  return oneLine.length > limit ? `${oneLine.slice(0, limit)}…` : oneLine
+}
+
+/** OCR 约定的列顺序，模型漏写表头时补上。 */
+const OCR_COLUMNS = '课程名称\t星期\t节次\t周次\t地点\t教师'
+
+/**
+ * 模型偶尔只给数据行、不给表头。
+ *
+ * 没有表头时解析器会退回「自由文本」模式，而那个模式要求节次带「节」字
+ * （不然「1-16周」会被当成第 1–16 节），于是整批行都判成「没认岀第几节」。
+ * 列顺序是 prompt 里定死的，直接补一行表头即可，只对 OCR 结果做，不动用户手贴的文本。
+ */
+function withHeaderIfMissing(text: string): string {
+  const rows = text.split('\n').filter((line) => line.trim() && !line.startsWith('#'))
+  if (rows.length === 0) return text
+  const everyRowTabular = rows.every((line) => line.split('\t').length >= 4)
+  const hasHeader = rows.some((line) => /课程|节次/.test(line))
+  if (!everyRowTabular || hasHeader) return text
+  return `${OCR_COLUMNS}\n${text}`
 }
 
 /** 调视觉模型读课表。settings 不传就读用户当前的配置。 */
@@ -166,21 +205,61 @@ export async function recognizeTimetable(
     prompt: TIMETABLE_PROMPT,
     images: [dataUrl],
     temperature: 0,
-    maxTokens: 2048,
+    // 一份课表能到十几门课、每门一行六字段，2048 有时候正好被截断，
+    // 截断后 content 是空的，看起来就像「模型什么都没读出来」。
+    maxTokens: 4096,
   })
 
   if (/NOT_TIMETABLE/.test(raw)) {
-    return { text: '', note: '模型说这张图不是课程表。换一张完整的课表截图试试。' }
+    return {
+      text: '',
+      note: '模型说这张图不是课程表。换一张完整的课表截图试试。',
+      empty: true,
+      raw: excerpt(raw),
+    }
   }
 
-  const text = normalizeVisionText(raw)
-  // 表头不算课，注释行（开学日）也不算。
-  const rows = text
-    .split('\n')
-    .filter((line) => line.trim() && !line.trim().startsWith('#')).length
-  const count = Math.max(0, rows - 1)
+  // 空返回要单独说：多半是 max_tokens 被截断，或者这个模型压根不收图片。
+  if (!raw.trim()) {
+    throw new Error(
+      '模型返回了空内容。常见原因是当前识图模型不收图片，或者输出被长度限制截断了。' +
+        '到设置页确认「识图模型」填的是带视觉的型号，比如 deepseek-flash。',
+    )
+  }
+
+  let text = normalizeVisionText(raw)
+  // 直接交给解析器数门课，别用「行数 - 1」估：模型可能不写表头（少算一门），
+  // 也可能塞进一行乱码（多算一门）。解析器认出来的才算数。
+  let parsed = parseTimetable(text, 20)
+  if (parsed.items.length === 0) {
+    const patched = withHeaderIfMissing(text)
+    if (patched !== text) {
+      text = patched
+      parsed = parseTimetable(text, 20)
+    }
+  }
+
+  if (parsed.items.length === 0) {
+    const firstFail = parsed.failed[0]
+    const detail = firstFail ? `；第一行的问题是「${firstFail.reason}」` : ''
+    return {
+      text: '',
+      // 把模型原话带出来，否则用户只会看到一句「没读出内容」，不知道到底哪儿不对。
+      note: excerpt(raw)
+        ? `没读出课程行。模型回的是：「${excerpt(raw)}」${detail}。多半是图太小或字太密，换一张更清楚的截图再试。`
+        : '没读出内容，检查图片是不是完整课表。',
+      empty: true,
+      raw: excerpt(raw),
+    }
+  }
+
   return {
     text,
-    note: count > 0 ? `读了 ${count} 门课，已填进下方，逐行核对后再导入。` : '没读出内容，检查图片是不是完整课表。',
+    note:
+      `读了 ${parsed.items.length} 门课` +
+      (parsed.failed.length > 0 ? `，${parsed.failed.length} 行没认出来` : '') +
+      '，已填进下方，逐行核对后再导入。',
+    empty: false,
+    raw: '',
   }
 }
