@@ -52,9 +52,10 @@ function decisionLabel(decision: Decision): string {
   return '不去'
 }
 
-/** 没手动选过时用哪个：已经过去的默认「不去」，拿不准的默认「待定」。 */
+/** 没手动选过时用哪个：别人的事和已经过去的默认「不去」，拿不准的默认「待定」。 */
 function defaultDecision(item: NoticeItem): Decision {
   if (item.expired) return 'skip'
+  if (item.relevance === 'other') return 'skip'
   return item.needConfirm ? 'later' : 'go'
 }
 
@@ -114,6 +115,15 @@ export function PlanDialog({ open, courses, onClose, onApply }: Props) {
    * 想补记的时候把这个勾去掉，过期条目照常可选。
    */
   const [hideExpired, setHideExpired] = useState(true)
+  /**
+   * 是否显示「别人的事」。
+   *
+   * 默认不显示：身份填了班级/年级/职务之后，通知里点别的班、别的年级的，
+   * 一条都不该占屏幕。想核对判断对不对再打开。
+   */
+  const [showOther, setShowOther] = useState(false)
+  /** 与身份无关、又没认岀时间的闲聊，解析时就被丢掉了，这里只记条数。 */
+  const [skipped, setSkipped] = useState(0)
   const fileRef = useRef<HTMLInputElement>(null)
 
   function changeDays(next: number): void {
@@ -132,17 +142,26 @@ export function PlanDialog({ open, courses, onClose, onApply }: Props) {
     setQueue([])
     setCursor(0)
     setNote(null)
+    setSkipped(0)
+    setShowOther(false)
   }, [open, bridge.enabled])
 
   // 已经过去的不再问「去不去」，问了也没意义。
-  const pending = useMemo(() => items.filter((item) => item.needConfirm && !item.expired), [items])
+  // 别人的事不逐个问，问了也是白问。
+  const pending = useMemo(
+    () => items.filter((item) => item.needConfirm && !item.expired && item.relevance !== 'other'),
+    [items],
+  )
 
   const expiredCount = useMemo(() => items.filter((item) => item.expired).length, [items])
-  /** 预览里实际列出来的条目。勾了「隐藏已过期」就把过去的滤掉。 */
-  const visible = useMemo(
-    () => (hideExpired ? items.filter((item) => !item.expired) : items),
-    [items, hideExpired],
-  )
+  const otherCount = useMemo(() => items.filter((item) => item.relevance === 'other').length, [items])
+  const mineCount = useMemo(() => items.filter((item) => item.relevance === 'mine').length, [items])
+  /** 预览里实际列出来的条目：过期的不显示（可选），别人的事不显示（可选）。 */
+  const visible = useMemo(() => {
+    let list = hideExpired ? items.filter((item) => !item.expired) : items
+    if (!showOther) list = list.filter((item) => item.relevance !== 'other')
+    return list
+  }, [items, hideExpired, showOther])
 
   const chosen = useMemo(() => {
     const result: PlanPayload[] = []
@@ -155,12 +174,21 @@ export function PlanDialog({ open, courses, onClose, onApply }: Props) {
   }, [items, decisions])
 
   function handleParse(messages: NoticeMessage[], from: string): void {
-    const parsed = sortNotices(parseNotices(messages, profile, today(), courses))
-    if (parsed.length === 0) return
+    const report = parseNotices(messages, profile, today(), courses)
+    const parsed = sortNotices(report.items)
     setItems(parsed)
+    setSkipped(report.skipped)
     setSource(from)
     setDecisions({})
     setStage('review')
+    if (parsed.length === 0) {
+      setNote({
+        text:
+          `读完 ${messages.length} 条，没有一条对得上你的身份` +
+          `（另有 ${report.skipped} 条无关闲聊已略过）。到设置页把「班级 / 学院、职务、关注词」写全一些，或者直接粘贴你要处理的那几条。`,
+        kind: 'info',
+      })
+    }
   }
 
   async function handleFetch(): Promise<void> {
@@ -353,6 +381,21 @@ export function PlanDialog({ open, courses, onClose, onApply }: Props) {
 
           {stage === 'review' ? (
             <div className="plan-list">
+              <div className="small muted" style={{ marginBottom: 6 }}>
+                按你的身份筛过：共 {items.length} 条，与你有关 {mineCount} 条
+                {skipped > 0 ? `；另有 ${skipped} 条无关闲聊没有列出来` : ''}
+              </div>
+
+              {otherCount > 0 ? (
+                <label className="check-line plan-filter">
+                  <input type="checkbox" checked={showOther} onChange={() => setShowOther((prev) => !prev)} />
+                  <span>
+                    显示与身份无关的（{otherCount} 条）
+                    <span className="small muted"> · 点了别的班/别的年级，默认不显示</span>
+                  </span>
+                </label>
+              ) : null}
+
               {expiredCount > 0 ? (
                 <label className="check-line plan-filter">
                   <input
@@ -369,7 +412,9 @@ export function PlanDialog({ open, courses, onClose, onApply }: Props) {
 
               {visible.length === 0 ? (
                 <div className="empty">
-                  这里只剩已经过去的事了。想补记就把上面那个勾去掉，或点「返回」把收集范围调小。
+                  {items.length === 0
+                    ? '这次没读到与你有关的通知。可以点「返回」换个范围，或直接把要处理的那几条粘进来。'
+                    : '剩下的都被筛掉了（已过期、或与你的身份无关）。上面两个勾去掉就能看到。'}
                 </div>
               ) : null}
 

@@ -59,7 +59,9 @@ export interface NoticeItem {
 }
 
 const SIGNUP_WORDS = /报名|自愿|有意|是否参加|接龙|统计|名额|可选|选报|扫码|有意者|需要参加|请回复/
-const EVERYONE_WORDS = /(全体|所有|每位|各班|全班|同学|同学们)/
+// 别把裸的「同学」算进来——「同学：有人去食堂吗」这种前缀会整条被判成面向全体，
+// 闲聊就这么漏进列表了。要求带上「全体/各位/同学们」这类限定。
+const EVERYONE_WORDS = /(全体|所有|每位|各位|各班|全班|同学们)/
 // 校区/园区/教学楼这些也是常见地点词，缺了「津南校区理科组团5B」就认不出来
 const PLACE_WORDS = /(?:校区|园区|教学楼|楼|室|厅|馆|场|中心|教室|会议室|操场|广场|报告厅|礼堂|机房|实验室)/
 // 「飞书私信我」不是线上会议；只有「飞书会议」「线上/直播」这类才算地点。
@@ -103,6 +105,10 @@ const TIME_CHINESE =
   /(清晨|凌晨|早上|早|上午|中午|下午|傍晚|晚上|晚)\s*([零一二三四五六七八九十两]{1,3})\s*点\s*(半|一刻|三刻|整)?/
 const TIME_CHINESE_MINUTE =
   /([零一二三四五六七八九十两]{1,3})\s*点\s*(半|一刻|三刻)/
+// 「下午4点」「4点半」「16点20分」：阿拉伯数字加「点」的写法群里最多，
+// 光有数字容易误伤（「注意一点」），所以要求带时段词或带上分钟。
+const TIME_ARABIC =
+  /(清晨|凌晨|早上|早|上午|中午|下午|傍晚|晚上|晚)?\s*(\d{1,2})\s*点\s*(?:(\d{1,2})\s*分\s*?)?(半|一刻|三刻|整)?/
 const CN_DIGITS: Record<string, number> = {
   零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
 }
@@ -132,6 +138,7 @@ function stripTime(text: string): string {
   return text
     .replace(TIME_RANGE, ' ')
     .replace(TIME_SINGLE, ' ')
+    .replace(TIME_ARABIC, ' ')
     .replace(TIME_CHINESE, ' ')
 }
 
@@ -148,6 +155,16 @@ function parseNoticeTime(text: string): { start: string; end: string | null } | 
 
   const single = text.match(TIME_SINGLE)
   if (single) return { start: normalize(single[2], single[3], single[1]), end: null }
+
+  const arabic = text.match(TIME_ARABIC)
+  if (arabic) {
+    const hour = Number(arabic[2])
+    const minute = arabic[3] ?? (arabic[4] ? cnMinute(arabic[4]) : null)
+    // 没写时段也没写分钟的「3点」不认，容易把「答对3点要求」这类话当成时间。
+    if (hour >= 0 && hour <= 24 && (arabic[1] || minute !== null)) {
+      return { start: normalize(arabic[2], minute ?? '00', arabic[1]), end: null }
+    }
+  }
 
   const chinese = text.match(TIME_CHINESE)
   if (chinese) {
@@ -238,6 +255,7 @@ function extractTitle(text: string): string {
     .replace(/(今天|明天|后天|大后天)/g, ' ')
     .replace(TIME_RANGE, ' ')
     .replace(TIME_SINGLE, ' ')
+    .replace(TIME_ARABIC, ' ')
     .replace(TIME_CHINESE, ' ')
     .replace(
       new RegExp(
@@ -283,12 +301,45 @@ function judgeRelevance(text: string, profile: Profile): { relevance: NoticeItem
     return { relevance: 'other', reason: `只点了 ${mentioned.join('、')}，不是你所在的 ${myClass}班` }
   }
 
+  // 年级：「2025级开会」跟你这个 2026 级没关系。这条比班级更早生效，
+  // 因为很多通知只写年级不写班，光看班级会全部落到「不确定」。
+  const grades = [...text.matchAll(/(20\d{2})\s*级/g)].map((item) => item[1])
+  const myGrade = profile.org.match(/(20\d{2})/)?.[1]
+  if (grades.length > 0 && myGrade && !grades.includes(myGrade)) {
+    return { relevance: 'other', reason: `只点了 ${grades.join('、')} 级，你是 ${myGrade} 级` }
+  }
+
+  // 学院/学部：通知里点名了另一个学院，而你不在其中。
+  // 只有身份里真写了「XX学院」才比这项——没写就别猜，否则「交到学院办公室」这种会被误判。
+  const myCollege = collegeNames(profile.org)[0]
+  const colleges = collegeNames(text).filter((name) => name !== myCollege)
+  if (myCollege && colleges.length > 0 && !colleges.some((name) => name.includes(myCollege) || myCollege.includes(name))) {
+    return { relevance: 'other', reason: `点的是${colleges.join('、')}学院，不是你的${myCollege}学院` }
+  }
+
   const tags = [...splitTags(profile.org), ...splitTags(profile.roles), ...splitTags(profile.keywords)]
   const hit = tags.find((tag) => text.includes(tag))
   if (hit) return { relevance: 'mine', reason: `提到了「${hit}」，与你的身份对得上` }
 
   if (EVERYONE_WORDS.test(text)) return { relevance: 'mine', reason: '面向全体同学' }
   return { relevance: 'maybe', reason: '没提到你的班级或职务，不确定和你有关' }
+}
+
+/**
+ * 从一段话里挑出院名（去掉「学院 / 学部」后缀）。
+ *
+ * 「材料学院」「电子信息与光学工程学院」要认出来，「交到学院办公室」里的
+ * 「日前交到」不算——所以尾部不许留动词，名字太短也不要。
+ */
+function collegeNames(text: string): string[] {
+  const names: string[] = []
+  for (const match of text.matchAll(/([\u4e00-\u9fa5]{2,10}?)(?:学院|学部)/g)) {
+    const name = match[1]
+    if (name.length < 2) continue
+    if (/[到于在的及和与交请给由为至从向把被]$/.test(name)) continue
+    names.push(name)
+  }
+  return names
 }
 
 /* --------------------------------- 冲突检查 -------------------------------- */
@@ -362,15 +413,22 @@ export function isDateDivider(text: string): boolean {
   return value.length > 0 && DIVIDER_RULES.some((rule) => rule.test(value))
 }
 
+export interface ParseReport {
+  items: NoticeItem[]
+  /** 与身份无关、又没认岀时间的闲聊，直接丢掉，不往列表里塞。 */
+  skipped: number
+}
+
 export function parseNotices(
   messages: NoticeMessage[],
   profile: Profile,
   baseDate: string = today(),
   courses: CourseRow[] = [],
-): NoticeItem[] {
+): ParseReport {
   const now = today()
+  let skipped = 0
 
-  return messages
+  const items = messages
     .map((message, index) => {
       if (isDateDivider(message.text)) return null
       const raw = stripPreamble(message.text.trim(), message.sender)
@@ -382,8 +440,11 @@ export function parseNotices(
       // 每条消息按它自己那天算「明天」「本周五」，跨天收集时不会算错。
       const anchor = message.date && /^\d{4}-\d{2}-\d{2}$/.test(message.date) ? message.date : baseDate
       const { deadline, rest } = parseDeadline(raw, anchor)
-      const date = parseDueDate(rest, anchor) ?? parseDueDate(raw, anchor) ?? null
       const time = parseNoticeTime(rest)
+      let date = parseDueDate(rest, anchor) ?? parseDueDate(raw, anchor) ?? null
+      // 「下午4点到机房」这种只给了钟点、没给哪天的：消息是今天的就按今天算，
+      // 不然它会因为没有日期被当成闲聊丢掉。往回翻的历史消息不补，免得造出过期日程。
+      if (!date && time && anchor >= now) date = anchor
       const location = parseLocation(raw)
       const { relevance, reason } = judgeRelevance(raw, profile)
       const signUp = SIGNUP_WORDS.test(raw)
@@ -426,7 +487,18 @@ export function parseNotices(
         reason: finalReason,
       }
     })
-    .filter((item): item is NoticeItem => item !== null)
+    .filter((item): item is NoticeItem => {
+      if (item === null) return false
+      // 既没认岀时间、也没有截止日期，还不是你的事——这就是群里的闲聊或别人的通知。
+      // 留着只会把真正要做的事压到下面，直接丢掉，只记个数。
+      if (!item.date && !item.deadline && item.relevance !== 'mine') {
+        skipped += 1
+        return false
+      }
+      return true
+    })
+
+  return { items, skipped }
 }
 
 /**
@@ -462,6 +534,14 @@ export function splitRawText(text: string, fallbackSource = '手动粘贴'): Not
     if (named) {
       source = named[1]
       messages.push({ source, sender: '', at: '', text: named[2].trim() })
+      continue
+    }
+
+    // 「辅导员：……」冒号前是人名或角色，当发送人存起来，别留在正文里
+    // （留着会进标题，还会让「同学」这类前缀干扰身份判断）。
+    const speaker = body.match(/^([\u4e00-\u9fa5A-Za-z0-9_]{1,10})\s*[：:]\s*(.+)$/)
+    if (speaker) {
+      messages.push({ source, sender: speaker[1], at: '', text: speaker[2].trim() })
       continue
     }
     // 上一行的续行：短行多半是被截断的半句话，接着上一条写。
