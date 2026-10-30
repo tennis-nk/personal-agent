@@ -55,6 +55,8 @@ DEFAULT_CONFIG = {
         "max_messages": 60,
         # 往回取几天：1 = 只看今天，最多 7。前端可以按请求临时覆盖。
         "days": 1,
+        # 读完把微信收回任务栏。想让它读完就停在屏幕上，改成 false。
+        "auto_hide": True,
     },
     "feishu": {
         "enabled": True,
@@ -390,14 +392,34 @@ def read_wechat(config: dict, today: date, days: int = 1) -> tuple[list[dict], l
             found.extend(_pick_window(name, raw[-limit:], today, days))
         return found, notes
 
+    # wxauto4 抓的是界面控件：窗口缩在任务栏时它一直空等到超时，
+    # 报出来的错像「没登录」，其实是没展开。读之前先放出来。
+    shown, why = show_wechat()
+    if not shown:
+        warnings.append(f"微信没读成：{why}")
+        return [], warnings
+
     try:
-        return wx_call(job, timeout=40)
+        return wx_call(job, timeout=_wx_timeout(len(sessions)))
     except WxMissing as error:
         warnings.append(f"微信没读成：{error}")
         return [], warnings
     except Exception as error:  # noqa: BLE001
         warnings.append(f"微信没读成：{error}。确认微信已登录并停在聊天页")
         return [], warnings
+    finally:
+        # 读完就收回去，别让微信一直占着屏幕。config 里 wechat.auto_hide 设 false 可以留着不收。
+        if section.get("auto_hide", True):
+            hide_wechat()
+
+
+def _wx_timeout(sessions: int) -> float:
+    """读一批会话给多久。
+
+    一个会话连切换带抓消息大约十几秒；固定 40 秒在读一周 × 十个群时必然超时，
+    看着像微信坏了。按会话数放宽，上限兜住别把 HTTP 请求挂太久。
+    """
+    return float(min(max(40, 15 * max(1, sessions)), 150))
 
 
 def _pick_window(source: str, raw: list, today: date, days: int = 1) -> list[dict]:
@@ -452,6 +474,100 @@ def _pick_window(source: str, raw: list, today: date, days: int = 1) -> list[dic
 # 飞书
 # --------------------------------------------------------------------------- #
 
+def force_foreground(hwnd: int) -> bool:
+    """把一个窗口真正切到前台。
+
+    最小化的先还原、藏起来的先显示，再挂一下输入线程才能抢到前台——
+    不挂的话 Windows 常常直接拒绝，看起来像「唤不起」。
+    """
+    try:
+        import win32con  # type: ignore
+        import win32gui  # type: ignore
+        import win32process  # type: ignore
+    except Exception as error:  # noqa: BLE001
+        log(f"缺少 pywin32，切不了前台：{error}")
+        return False
+
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        elif not win32gui.IsWindowVisible(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+        current = win32gui.GetForegroundWindow()
+        if current == hwnd:
+            return True
+        # 不挂一下输入线程，Windows 常常拒绝切换前台窗口。
+        threads = (
+            win32process.GetWindowThreadProcessId(current)[0],
+            win32process.GetWindowThreadProcessId(hwnd)[0],
+        )
+        win32process.AttachThreadInput(*threads, True)
+        win32gui.SetForegroundWindow(hwnd)
+        win32process.AttachThreadInput(*threads, False)
+        return True
+    except Exception as error:  # noqa: BLE001
+        log(f"切换前台失败：{error}")
+        return False
+
+
+def wechat_hwnd() -> int:
+    """找微信主窗口。
+
+    优先按类名（WeChatMainWndForPC）找，比标题稳：缩在任务栏、标题被改成
+    「微信 (2)」、甚至收进托盘（窗口整个隐藏）都还能找到。
+    """
+    try:
+        import win32gui  # type: ignore
+    except Exception:  # noqa: BLE001
+        return 0
+
+    hwnd = win32gui.FindWindow("WeChatMainWndForPC", None)
+    if hwnd:
+        return hwnd
+
+    found: list[int] = []
+
+    def _enum(handle: int, _: object) -> None:
+        title = win32gui.GetWindowText(handle) or ""
+        if "微信" in title:
+            found.append(handle)
+
+    win32gui.EnumWindows(_enum, None)
+    return found[0] if found else 0
+
+
+def show_wechat() -> tuple[bool, str]:
+    """读之前把微信从任务栏（或托盘）里放出来。
+
+    wxauto4 抓的是界面控件，窗口缩起来时它只会一直等，最后报一句
+    「超过 40 秒没返回」——看着像没登录，其实只是窗口没展开。
+    """
+    hwnd = wechat_hwnd()
+    if not hwnd:
+        return False, "没找到微信窗口，确认微信是登录着的"
+    if not force_foreground(hwnd):
+        return False, "微信窗口切不到前台，手动点一下再试"
+    # 还原之后要等界面画出来，控件树才完整，太快抓会抓到空列表。
+    time.sleep(0.8)
+    return True, ""
+
+
+def hide_wechat() -> bool:
+    """读完之后把微信收回任务栏，别一直占着屏幕。"""
+    hwnd = wechat_hwnd()
+    if not hwnd:
+        return False
+    try:
+        import win32con  # type: ignore
+        import win32gui  # type: ignore
+
+        win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+        return True
+    except Exception as error:  # noqa: BLE001
+        log(f"收起微信窗口失败：{error}")
+        return False
+
+
 def activate_window(keyword: str) -> bool:
     """把窗口弹到前台。
 
@@ -459,9 +575,7 @@ def activate_window(keyword: str) -> bool:
     用 win32 枚举窗口，比 UIA 稳——飞书的 UIA 树里基本没有可用节点。
     """
     try:
-        import win32con  # type: ignore
         import win32gui  # type: ignore
-        import win32process  # type: ignore
     except Exception as error:  # noqa: BLE001
         log(f"缺少 pywin32，唤不起窗口：{error}")
         return False
@@ -479,30 +593,7 @@ def activate_window(keyword: str) -> bool:
     if not found:
         return False
 
-    hwnd = found[0]
-    try:
-        if win32gui.IsIconic(hwnd):
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-        current = win32gui.GetForegroundWindow()
-        if current != hwnd:
-            # 不挂一下输入线程，Windows 常常拒绝切换前台窗口。
-            win32process.AttachThreadInput(
-                win32process.GetWindowThreadProcessId(current)[0],
-                win32process.GetWindowThreadProcessId(hwnd)[0],
-                True,
-            )
-            win32gui.SetForegroundWindow(hwnd)
-            win32process.AttachThreadInput(
-                win32process.GetWindowThreadProcessId(current)[0],
-                win32process.GetWindowThreadProcessId(hwnd)[0],
-                False,
-            )
-        else:
-            win32gui.SetForegroundWindow(hwnd)
-    except Exception as error:  # noqa: BLE001
-        log(f"切换前台失败：{error}")
-        return False
-    return True
+    return force_foreground(found[0])
 
 
 def read_clipboard() -> str:

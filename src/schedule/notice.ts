@@ -67,6 +67,14 @@ export interface NoticeItem {
 }
 
 const SIGNUP_WORDS = /报名|自愿|有意|是否参加|接龙|统计|名额|可选|选报|扫码|有意者|需要参加|请回复/
+/**
+ * 像「正事」的词：作业、报名、截止、会议这一类。
+ *
+ * 群里留作业常常就一句「发布第5次作业 习题二：22 23」，既不点名也不写哪天交。
+ * 按「没日期又不是你的事」丢掉的话，最要紧的东西反而没了——所以命中这些词就算你的事。
+ */
+const MATTER_WORDS =
+  /作业|通知|报名|截止|提交|上交|会议|讲座|报告|考试|测验|补考|集合|签到|材料|申请表|体检|答辩|宣讲|培训|选举|投票|务必|请于|安排|领取|填表|调查问卷/
 // 别把裸的「同学」算进来——「同学：有人去食堂吗」这种前缀会整条被判成面向全体，
 // 闲聊就这么漏进列表了。要求带上「全体/各位/同学们」这类限定。
 const EVERYONE_WORDS = /(全体|所有|每位|各位|各班|全班|同学们)/
@@ -330,6 +338,12 @@ function judgeRelevance(text: string, profile: Profile): { relevance: NoticeItem
   if (hit) return { relevance: 'mine', reason: `提到了「${hit}」，与你的身份对得上` }
 
   if (EVERYONE_WORDS.test(text)) return { relevance: 'mine', reason: '面向全体同学' }
+
+  // 身份一个都没对上，但话里说的是正事（留作业、发通知、报名截止）：
+  // 这种漏掉的代价太大，算你的事，让用户在预览里自己划掉，而不是在这里悄悄丢掉。
+  const matter = text.match(MATTER_WORDS)
+  if (matter) return { relevance: 'mine', reason: `提到了「${matter[0]}」，是一条要办的事` }
+
   return { relevance: 'maybe', reason: '没提到你的班级或职务，不确定和你有关' }
 }
 
