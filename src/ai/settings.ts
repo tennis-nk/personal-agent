@@ -94,8 +94,8 @@ export const VISION_PRESETS: Preset[] = [
     baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
     model: 'glm-4v-flash',
     hint:
-      '免费、不做长推理，适合读表格。它的接口不回跨域头，浏览器直连会被拦，' +
-      '要经本机助手转发（双击「启动信息管家.bat」）。若提示模型不存在，把型号改成 glm-4.6v-flash',
+      '免费、不做长推理，适合读表格。两个限制要知道：接口不回跨域头，必须经本机助手转发；' +
+      '内容审核偏严，课表里有「思政」类课程名或学号姓名时可能整单被拒，那就换通义。若提示模型不存在，把型号改成 glm-4.6v-flash',
   },
   {
     id: 'qwen-vl',

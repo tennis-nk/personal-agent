@@ -29,6 +29,16 @@ const TIMETABLE_PROMPT = `这是一张课程表的截图。请把它读成纯文
 6. 如果这张图不是课程表，只输出一行：NOT_TIMETABLE。
 7. 只要图里能看出课程格子就照实输出，字段看不清就留空，**不要**写「看不清」「无法识别」这类话代替数据行。`
 
+/**
+ * 审核拦下来时的备用问法：短、不带任何附加要求。
+ *
+ * 智谱会把整段提示连同图片一起过审核，长提示里「如果这张图不是课程表，就输出
+ * NOT_TIMETABLE」这类元指令有时会被判成可疑内容。换一句最小的话再问一次，
+ * 能过就过，过不了再报错也不亏。
+ */
+const NEUTRAL_PROMPT =
+  '请把这张课程表里的内容转成文字。每行一门课，依次写课程名称、星期、节次、周次、地点、教师，用 Tab 分隔，不要解释。'
+
 
 /** 图片转成 data URL，顺手压一下体积。 */
 export async function fileToDataUrl(file: File, maxSide = MAX_SIDE): Promise<string> {
@@ -237,6 +247,7 @@ export async function recognizeTimetable(
 
   let raw = ''
   let lastError: unknown = null
+  let triedNeutral = false
   for (const plan of plans) {
     const source = plan.side > 0 ? await shrinkDataUrl(dataUrl, plan.side) : dataUrl
     try {
@@ -252,6 +263,20 @@ export async function recognizeTimetable(
       if (error instanceof LlmError && error.code === 'truncated') {
         lastError = error
         continue
+      }
+      // 被内容审核拦下时换一句朴素的话再问一次：长提示里的附加要求
+      // （「如果这张图不是课程表就输出 NOT_TIMETABLE」之类）偶尔会被误判。
+      // 同时把图缩一档——审核对又大又密的图更容易误伤。
+      if (error instanceof LlmError && error.code === 'content_filter' && !triedNeutral) {
+        triedNeutral = true
+        const smaller = plan.side > 0 ? source : await shrinkDataUrl(dataUrl, 1400).catch(() => dataUrl)
+        raw = await visionChat(vision, {
+          prompt: NEUTRAL_PROMPT,
+          images: [smaller],
+          temperature: 0,
+          maxTokens: plan.tokens,
+        })
+        break
       }
       throw error
     }

@@ -261,6 +261,17 @@ function lowerTokenCap(endpoint: string, detail: string, current?: number): numb
 }
 
 /**
+ * 内容审核把整个请求拒了。
+ *
+ * 智谱常见的一句话：「系统检测到输入或生成内容可能包含不安全或敏感内容」。
+ * 它既可能是图里的字（姓名、学号），也可能是提示语本身，还可能是校对模型误判，
+ * 换一句话重问有时就过了，所以调用方可以拿这个码再做一次更朴素的尝试。
+ */
+function contentFiltered(detail: string): boolean {
+  return /敏感|不安全|审核|违规|safety|moderation|risk control/i.test(detail)
+}
+
+/**
  * 识图：一次性取回整段答案（不流式）。
  *
  * 图片走 OpenAI 的 content 数组格式，各家通用；流式在这里没意义，
@@ -298,6 +309,7 @@ export async function visionChat(settings: LlmSettings, options: VisionOptions):
     }
     if (!response.ok) {
       const paramIssue = /max_tokens|temperature|invalid|参数|范围/i.test(detail)
+      if (contentFiltered(detail)) throw new LlmError(detail, 'content_filter')
       if (paramIssue) throw new LlmError(detail, 'request_failed')
       // 纯文本模型收到图片基本都是 400，先按「不收图片」给提示，比让用户读原始报错有用。
       if (response.status === 400 || response.status === 422) {
@@ -356,6 +368,8 @@ export function describeLlmError(error: unknown): string {
         return `${error.message}｜请检查设置里的 API Key 是否正确、是否已过期。`
       case 'request_failed':
         return `${error.message}｜接口不认这次请求的参数：多半是这个型号对参数有更严的限制（比如 max_tokens 上限），或者「识图模型」填成了文本型号。`
+      case 'content_filter':
+        return `${error.message}｜这是服务商的内容审核把请求拦了，跟你的网络、Key 都无关。截图里带姓名、学号、证件号，或者课程名被审核词命中，都会这样。先试「只框课表那块」的小图；还不行就换一家视觉模型——通义 qwen-vl-max、硅基流动的 Qwen-VL 对这类内容宽松得多。`
       case 'not_found':
         return `${error.message}｜请检查接口地址和模型名是否填对。`
       case 'rate_limited':
