@@ -74,10 +74,18 @@ const SIGNUP_WORDS = /报名|自愿|有意|是否参加|接龙|统计|名额|可
  * 按「没日期又不是你的事」丢掉的话，最要紧的东西反而没了——所以命中这些词就算你的事。
  */
 const MATTER_WORDS =
-  /作业|通知|报名|截止|提交|上交|会议|讲座|报告|考试|测验|补考|集合|签到|材料|申请表|体检|答辩|宣讲|培训|选举|投票|务必|请于|安排|领取|填表|调查问卷/
+  /作业|通知|报名|截止|提交|上交|会议|讲座|报告|考试|测验|补考|集合|签到|材料|申请表|登记表|登记|表格|名单|学时|缴费|盖章|体检|答辩|宣讲|培训|选举|投票|评议|测评|务必|请于|安排|领取|填表|调查问卷/
+/**
+ * 说这件事是在「布置」的动词。光有正事词不算——群里围绕一条通知能聊上几十句，
+ * 「原来要签到吗」「不知道要签到」里都有「签到」，但它们是要办的事之外的回声。
+ * 微信和飞书用的是同一套标准，不然会出现一边筛得干净、一边全进来的错觉。
+ */
+const NOTICE_VERBS =
+  /发布|通知|要求|务必|安排|提交|上交|截止|报名|开展|举行|举办|召开|领取|填表|请于|请大家|请各位|请同学|请在|请注意|记得|不要忘|别忘了|按时|逾期|统一|交一下|交到|交给|发一下|发到|填一下|报一下|回复一下|确认一下|麻烦/
 // 别把裸的「同学」算进来——「同学：有人去食堂吗」这种前缀会整条被判成面向全体，
-// 闲聊就这么漏进列表了。要求带上「全体/各位/同学们」这类限定。
-const EVERYONE_WORDS = /(全体|所有|每位|各位|各班|全班|同学们)/
+// 闲聊就这么漏进列表了。要求带上「全体/各位同学/同学们」这类限定；
+// 「各位主任老师好」是发给老师的，也不能算你的事。
+const EVERYONE_WORDS = /(全体|每位|各位同学|各班|全班|同学们|所有同学|@所有人)/
 // 校区/园区/教学楼这些也是常见地点词，缺了「津南校区理科组团5B」就认不出来
 const PLACE_WORDS = /(?:校区|园区|教学楼|楼|室|厅|馆|场|中心|教室|会议室|操场|广场|报告厅|礼堂|机房|实验室)/
 // 「飞书私信我」不是线上会议；只有「飞书会议」「线上/直播」这类才算地点。
@@ -341,8 +349,13 @@ function judgeRelevance(text: string, profile: Profile): { relevance: NoticeItem
 
   // 身份一个都没对上，但话里说的是正事（留作业、发通知、报名截止）：
   // 这种漏掉的代价太大，算你的事，让用户在预览里自己划掉，而不是在这里悄悄丢掉。
+  // 前提是这句话确实在「布置」这件事——只出现「签到」「投票」这种词不行，
+  // 否则群里围着通知的讨论（「原来要签到吗」）会整片被当成你的事。
   const matter = text.match(MATTER_WORDS)
-  if (matter) return { relevance: 'mine', reason: `提到了「${matter[0]}」，是一条要办的事` }
+  const verb = text.match(NOTICE_VERBS)
+  if (matter && verb) {
+    return { relevance: 'mine', reason: `提到了「${matter[0]}」，是一条要办的事（${verb[0]}）` }
+  }
 
   return { relevance: 'maybe', reason: '没提到你的班级或职务，不确定和你有关' }
 }
@@ -450,14 +463,15 @@ export function parseNotices(
   const now = today()
   let skipped = 0
 
-  const items = messages
-    .map((message, index) => {
-      if (isDateDivider(message.text)) return null
+  const items: NoticeItem[] = []
+
+  messages.forEach((message, index) => {
+      if (isDateDivider(message.text)) return
       const raw = stripPreamble(message.text.trim(), message.sender)
-      if (!raw) return null
+      if (!raw) return
       // 群里常有人只丢一个链接（公众号文章、金山文档）。去掉链接和标点后没剩内容，
       // 就不是一条能被安排的事，别让它占一条待办。
-      if (!hasRealContent(raw)) return null
+      if (!hasRealContent(raw)) return
 
       // 每条消息按它自己那天算「明天」「本周五」，跨天收集时不会算错。
       const anchor = message.date && /^\d{4}-\d{2}-\d{2}$/.test(message.date) ? message.date : baseDate
@@ -492,7 +506,19 @@ export function parseNotices(
         finalReason = `${finalReason}；这条是 ${date} 的，已经过去了`
       }
 
-      return {
+      // 这条有没有能拿去安排的信息：认出了钟点、认出了截止、或者话里写了明确的日期
+      // （「明天」「11月6日」）。只等于发送日期的不算——飞书每条消息都带发送日期，
+      // 拿它当依据等于一条都不筛，和微信那路就不一样了。
+      const explicit = Boolean(time || deadline || (date && date !== anchor))
+
+      // 没有能安排的时间、又不是你的事、也不要你回复——这就是群里的闲聊或别人的讨论。
+      // 留着只会把真正要做的事压到下面，直接丢掉，只记个数。
+      if (!explicit && relevance !== 'mine' && !(signUp && relevance !== 'other')) {
+        skipped += 1
+        return
+      }
+
+      items.push({
         id: `notice-${index}-${message.source}-${message.at}`.replace(/\s/g, ''),
         source: message.source,
         channel: message.channel ?? '',
@@ -508,18 +534,8 @@ export function parseNotices(
         needConfirm,
         expired,
         reason: finalReason,
-      }
-    })
-    .filter((item): item is NoticeItem => {
-      if (item === null) return false
-      // 既没认岀时间、也没有截止日期，还不是你的事——这就是群里的闲聊或别人的通知。
-      // 留着只会把真正要做的事压到下面，直接丢掉，只记个数。
-      if (!item.date && !item.deadline && item.relevance !== 'mine') {
-        skipped += 1
-        return false
-      }
-      return true
-    })
+      })
+  })
 
   return { items, skipped }
 }
