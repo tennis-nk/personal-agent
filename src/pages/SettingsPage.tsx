@@ -19,6 +19,8 @@ import {
   loadBridge,
   loadProfile,
   loadRemoteBridge,
+  loadSpeakers,
+  recordSpeakers,
   fetchFeishuChats,
   fetchFeishuStatus,
   startFeishuLogin,
@@ -30,6 +32,69 @@ import {
 } from '../data/profile'
 import type { Profile } from '../schedule/notice'
 import { ConfirmDialog } from '../components/ConfirmDialog'
+
+/** 白名单里一行一个群：「群名」或「群名|张三,李四」。 */
+function splitGroupLines(text: string): string[] {
+  return text
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+}
+
+function groupName(entry: string): string {
+  return entry.split('|')[0].trim()
+}
+
+/** 把一个发送人加进某个群那一行；这个群还没在名单里就整行新增。 */
+function upsertSender(text: string, group: string, sender: string): string {
+  const lines = splitGroupLines(text)
+  const index = lines.findIndex((line) => groupName(line) === group)
+  if (index < 0) return [...lines, `${group}|${sender}`].join('\n')
+  const [name, tail] = lines[index].split('|')
+  const people = (tail ?? '')
+    .split(/[,，、;；]/)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0)
+  if (people.includes(sender)) return text
+  people.push(sender)
+  lines[index] = `${name.trim()}|${people.join(',')}`
+  return lines.join('\n')
+}
+
+function SpeakerPicker({
+  title,
+  groups,
+  onPick,
+}: {
+  title: string
+  groups: Record<string, string[]>
+  onPick: (group: string, sender: string) => void
+}) {
+  const entries = Object.entries(groups)
+  if (entries.length === 0) return null
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div className="small muted">{title}</div>
+      {entries.map(([group, people]) => (
+        <div key={group} style={{ marginTop: 6 }}>
+          <div className="small">{group}</div>
+          <div className="row wrap" style={{ marginTop: 4, gap: 6 }}>
+            {people.slice(0, 20).map((person) => (
+              <button
+                key={person}
+                className="btn small"
+                title={`只看「${group}」里 ${person} 发的`}
+                onClick={() => onPick(group, person)}
+              >
+                {person}
+              </button>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
 
 /**
  * 设置页。
@@ -69,6 +134,8 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
   const [sessionPool, setSessionPool] = useState<string[]>([])
   const [savingSessions, setSavingSessions] = useState(false)
   const [listingSessions, setListingSessions] = useState(false)
+  /** 最近一次读取里各群的说话人，用来点选，不用手打名字。 */
+  const [speakers, setSpeakers] = useState(() => loadSpeakers())
   /** 本机助手跑在哪个解释器上、能不能读微信。连不上时是 null。 */
   const [health, setHealth] = useState<BridgeHealth | null>(null)
 
@@ -166,9 +233,10 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
     loadRemoteBridge(bridge)
       .then((remote) => {
         if (!alive || !remote) return
-        setSessionsText(remote.wechat?.sessions?.join(', ') ?? '')
+        // 一行一个群，「群名|张三」表示只看张三发的。
+        setSessionsText((remote.wechat?.sessions ?? []).join('\n'))
         setFeishuMode(remote.feishu?.mode === 'sdk' ? 'sdk' : 'clipboard')
-        setFeishuChatsText(remote.feishu?.chats?.join(', ') ?? '')
+        setFeishuChatsText((remote.feishu?.chats ?? []).join('\n'))
       })
       .catch(() => {
         // 拉不到就用本地空值，用户手填再保存。
@@ -179,31 +247,32 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
   }, [bridge.enabled, bridge.port])
 
   function splitSessions(): string[] {
-    return sessionsText
-      .split(/[,，、;；\n]/)
-      .map((item) => item.trim())
-      .filter((item) => item.length > 0)
+    return splitGroupLines(sessionsText)
   }
 
   function addSession(name: string): void {
     const current = splitSessions()
-    if (current.includes(name)) return
-    setSessionsText([...current, name].join(', '))
+    if (current.some((item) => groupName(item) === name)) return
+    setSessionsText([...current, name].join('\n'))
   }
 
   // ------------------------------ 飞书 ------------------------------
 
   function splitFeishuChats(): string[] {
-    return feishuChatsText
-      .split(/[,，、;；\n]/)
-      .map((item) => item.trim())
-      .filter((item) => item.length > 0)
+    return splitGroupLines(feishuChatsText)
   }
 
   function addFeishuChat(name: string): void {
     const current = splitFeishuChats()
-    if (current.includes(name)) return
-    setFeishuChatsText([...current, name].join(', '))
+    if (current.some((item) => groupName(item) === name)) return
+    setFeishuChatsText([...current, name].join('\n'))
+  }
+
+  /** 点「最近读到的人」：把人加进对应群那一行，只看他发的。 */
+  function addSender(channel: '微信' | '飞书', group: string, sender: string): void {
+    if (channel === '微信') setSessionsText((text) => upsertSender(text, group, sender))
+    else setFeishuChatsText((text) => upsertSender(text, group, sender))
+    setBridgeResult(`已把「${sender}」加进「${group}」，点「保存群名」后生效。`)
   }
 
   /** 保存飞书设置（模式 + 群名）到本机服务的 config.json。 */
@@ -355,6 +424,8 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
     setBridgeResult('')
     try {
       const messages = await fetchToday(bridge)
+      // 顺手记下各群的说话人，下面的「最近读到的人」就能直接点选。
+      setSpeakers(recordSpeakers(messages))
       setBridgeResult(
         `已连上：127.0.0.1:${bridge.port}，抓到 ${messages.length} 条当天消息。` +
           (messages[0] ? `最新一条来自「${messages[0].source}」。` : ''),
@@ -661,15 +732,19 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
             </div>
 
             <div className="field" style={{ marginTop: 10 }}>
-              <div className="field-label">微信群名（逗号分隔，只这些会话会被读取）</div>
-              <input
+              <div className="field-label">微信群名（一行一个，只这些会话会被读取）</div>
+              <textarea
                 className="input"
+                rows={4}
                 value={sessionsText}
-                placeholder="班级群, 年级通知群"
+                placeholder={'2026级自动化1班群|王超\n年级通知群'}
                 onChange={(event) => setSessionsText(event.target.value)}
               />
               <div className="small muted">
                 留空就完全不读微信。写不全也能匹配，比如填「自动化」能命中「2026级自动化1班群」。
+                <br />
+                竖线后面写人名，就只看这些人发的，例如 <code>2026级自动化1班群|王超,李彪</code>。
+                名字按微信里的群昵称写，包含匹配——写「王超」也能命中「王超老师」。
               </div>
             </div>
 
@@ -698,6 +773,12 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
               </div>
             ) : null}
 
+            <SpeakerPicker
+              title="最近读到的人（点一下，就只看他在该群发的消息）："
+              groups={speakers['微信'] ?? {}}
+              onPick={(group, sender) => addSender('微信', group, sender)}
+            />
+
             <div className="sub-divider">飞书</div>
 
             <div className="field">
@@ -721,15 +802,19 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
             {feishuMode === 'sdk' ? (
               <>
                 <div className="field" style={{ marginTop: 10 }}>
-                  <div className="field-label">飞书群名（逗号分隔，只这些群会被读取）</div>
-                  <input
+                  <div className="field-label">飞书群名（一行一个，只这些群会被读取）</div>
+                  <textarea
                     className="input"
+                    rows={4}
                     value={feishuChatsText}
-                    placeholder="年级通知群, 班级群"
+                    placeholder={'年级通知群|王超\n班级群'}
                     onChange={(event) => setFeishuChatsText(event.target.value)}
                   />
                   <div className="small muted">
                     留空就完全不读飞书。名字可以写不全，能命中子串就行。
+                    <br />
+                    竖线后面写人名，就只看这些人发的，例如 <code>年级通知群|王超</code>。
+                    这里写飞书里的名字（一般是真名），和微信的群昵称各算各的。
                   </div>
                 </div>
 
@@ -789,6 +874,12 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
                     </div>
                   </div>
                 ) : null}
+
+                <SpeakerPicker
+                  title="最近读到的人（点一下，就只看他在该群发的消息）："
+                  groups={speakers['飞书'] ?? {}}
+                  onPick={(group, sender) => addSender('飞书', group, sender)}
+                />
               </>
             ) : null}
 

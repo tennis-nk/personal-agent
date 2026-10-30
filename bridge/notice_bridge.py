@@ -320,6 +320,36 @@ def is_system_noise(sender: str, text: str) -> bool:
     return any(rule in body for rule in _NOISE_RULES)
 
 
+def parse_group_entry(entry: str) -> tuple[str, list[str]]:
+    """白名单里的一行：「群名」或「群名|张三,李四」。
+
+    竖线后面是「只看这些人的消息」。微信和飞书各填各的，同一个人在两个应用里
+    显示名不一样也不会串——微信里是群昵称，飞书里是真名。
+    """
+    if not isinstance(entry, str):
+        return "", []
+    name, _, tail = entry.partition("|")
+    senders = [item.strip() for item in re.split(r"[,，、;；]", tail) if item.strip()]
+    return name.strip(), senders
+
+
+def sender_hit(sender: str, wanted: list[str]) -> bool:
+    """发送人对不对得上。名单是空的就是都要。
+
+    用包含判断而不是全等：群里显示名常带后缀（「王超老师」「王超-辅导员」），
+    写「王超」应该能命中。
+    """
+    if not wanted:
+        return True
+    name = (sender or "").strip()
+    if not name:
+        return False
+    for item in wanted:
+        if item in name or name in item:
+            return True
+    return False
+
+
 def list_wechat_sessions() -> tuple[list[str], str]:
     """列出微信会话名，省得用户手打群名。微信没开就返回空。"""
 
@@ -364,10 +394,17 @@ def read_wechat(config: dict, today: date, days: int = 1) -> tuple[list[dict], l
     if not section.get("enabled"):
         return [], warnings
 
-    sessions = [item for item in section.get("sessions", []) if isinstance(item, str) and item.strip()]
-    if not sessions:
+    entries = [
+        parsed
+        for parsed in (parse_group_entry(item) for item in section.get("sessions", []))
+        if parsed[0]
+    ]
+    if not entries:
         warnings.append("微信白名单是空的，在 config.json 的 wechat.sessions 里填上群名")
         return [], warnings
+    sessions = [name for name, _ in entries]
+    # 群里指定的人：留空就是整个群都要。
+    wanted_map = {name: senders for name, senders in entries}
 
     days = max(1, min(7, int(days or 1)))
     # 要往回看好几天，就得比「只看今天」多取一些消息；上限兜住，别把整个聊天记录读进来。
@@ -389,7 +426,10 @@ def read_wechat(config: dict, today: date, days: int = 1) -> tuple[list[dict], l
             except Exception as error:  # noqa: BLE001
                 notes.append(f"读取「{name}」失败：{error}")
                 continue
-            found.extend(_pick_window(name, raw[-limit:], today, days))
+            wanted = wanted_map.get(name) or []
+            found.extend(_pick_window(name, raw[-limit:], today, days, wanted))
+            if wanted:
+                notes.append(f"「{name}」只看 {'、'.join(wanted)} 发的话")
         return found, notes
 
     # wxauto4 抓的是界面控件：窗口缩在任务栏时它一直空等到超时，
@@ -422,7 +462,13 @@ def _wx_timeout(sessions: int) -> float:
     return float(min(max(40, 15 * max(1, sessions)), 150))
 
 
-def _pick_window(source: str, raw: list, today: date, days: int = 1) -> list[dict]:
+def _pick_window(
+    source: str,
+    raw: list,
+    today: date,
+    days: int = 1,
+    wanted: list[str] | None = None,
+) -> list[dict]:
     """从一个会话的消息流里挑出最近 days 天的。
 
     消息流里没有绝对日期，靠日期分割条（今天 / 昨天 / 10月29日）判断归属：
@@ -430,6 +476,8 @@ def _pick_window(source: str, raw: list, today: date, days: int = 1) -> list[dic
 
     每条消息都带上它所属的日期（date），前端算「明天下午两点」时要用这一天做基准，
     否则往回取三天时，前天说的「明天」会被算成今天往后一天。
+
+    wanted 是这个群里指定要看的人；空就是全要。
     """
     days = max(1, min(7, int(days or 1)))
     cutoff = today - timedelta(days=days - 1)
@@ -456,6 +504,9 @@ def _pick_window(source: str, raw: list, today: date, days: int = 1) -> list[dic
             # 一条分割条都没见到，就当是今天的，回头由用户自己在预览里删。
             context = today
         if context < cutoff or context > today:
+            continue
+        # 指定了人，就只留这个人发的。没指定（wanted 为空）就整群都要。
+        if not sender_hit(sender, wanted or []):
             continue
         match = TIME_PATTERN.search(text)
         messages.append(
@@ -631,7 +682,19 @@ def read_feishu(config: dict, days: int = 1) -> tuple[list[dict], list[str]]:
         # 天数跟请求走（?days=），和微信那一路保持一致，弹窗里改范围立刻生效。
         if feishu_sdk is None:
             return [], ["飞书 SDK 不可用：在本机跑一次 pip install lark-oapi"]
-        return feishu_sdk.collect(list(section.get("chats") or []), days)
+        entries = [
+            parsed
+            for parsed in (parse_group_entry(item) for item in section.get("chats", []))
+            if parsed[0]
+        ]
+        if not entries:
+            return [], ["飞书群名单是空的，设置页里填上要读的群名"]
+        # 飞书里是真实姓名，和微信的群昵称不是一套，各填各的。
+        return feishu_sdk.collect(
+            [name for name, _ in entries],
+            days,
+            {name: senders for name, senders in entries if senders},
+        )
 
     if not section.get("use_clipboard", True):
         return [], warnings

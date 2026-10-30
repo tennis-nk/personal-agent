@@ -61,6 +61,42 @@ export function saveBridge(config: BridgeConfig): void {
   write(BRIDGE_KEY, config)
 }
 
+/**
+ * 最近一次读取里，每个群都有谁说过话。
+ *
+ * 群里要只看某几个人时，名字手打最容易出错——打错一个字，整个群就一条都读不到。
+ * 所以读完顺手记下来，设置页里点一下就加进白名单。按应用分开记：
+ * 同一个人微信里叫「王超老师」、飞书里叫「王超」。
+ */
+export type SpeakerMap = Record<string, Record<string, string[]>>
+
+const SPEAKERS_KEY = 'infobutler.speakers.v1'
+
+export function loadSpeakers(): SpeakerMap {
+  return read<SpeakerMap>(SPEAKERS_KEY, {})
+}
+
+/** 把这次读到的说话人合进已有的名单，去重、保序，每个群最多留 30 个。 */
+export function recordSpeakers(messages: NoticeMessage[]): SpeakerMap {
+  const merged = loadSpeakers()
+  for (const message of messages) {
+    const channel = message.channel ?? ''
+    const group = message.source ?? ''
+    const sender = (message.sender ?? '').trim()
+    if (!channel || !group || !sender || sender === '未署名') continue
+    const bucket = (merged[channel] ??= {})
+    const list = (bucket[group] ??= [])
+    if (!list.includes(sender)) list.push(sender)
+  }
+  for (const groups of Object.values(merged)) {
+    for (const [group, list] of Object.entries(groups)) {
+      groups[group] = list.slice(0, 30)
+    }
+  }
+  write(SPEAKERS_KEY, merged)
+  return merged
+}
+
 /** 本机服务那边的完整配置，白名单会话名存在这里，不在浏览器里。 */
 export interface BridgeRemoteConfig {
   port: number

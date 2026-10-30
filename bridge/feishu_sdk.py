@@ -523,11 +523,34 @@ def status() -> dict:
     }
 
 
-def collect(chats: list[str], days: int = 1) -> tuple[list[dict], list[str]]:
+def sender_hit(sender: str, wanted: list[str]) -> bool:
+    """发送人对不对得上；名单空就是全要。
+
+    跟微信那路各有一份（两个模块不互相引用）。飞书里显示的是真实姓名，
+    群里改过群昵称也不影响，按真名比就行。
+    """
+    if not wanted:
+        return True
+    name = (sender or "").strip()
+    if not name:
+        return False
+    for item in wanted:
+        if item in name or name in item:
+            return True
+    return False
+
+
+def collect(
+    chats: list[str],
+    days: int = 1,
+    senders: dict[str, list[str]] | None = None,
+) -> tuple[list[dict], list[str]]:
     """按群名列表收集最近 days 天的消息，返回 (消息, 警告)。
 
     输出结构跟老的剪贴板路径完全一致，上层的通知解析器不用改：
     {source, sender, at, text, date}
+
+    senders 是「群名 -> 只看这些人的消息」；没列的群整群都要。
     """
     warnings: list[str] = []
     if not load_auth().get("client_id"):
@@ -551,7 +574,11 @@ def collect(chats: list[str], days: int = 1) -> tuple[list[dict], list[str]]:
         except (NotLoggedIn, FeishuError) as error:
             warnings.append(f"飞书群「{name}」读取失败：{error}")
             continue
+        # 群里指定的人：先按群里显示的名字查，再按白名单里写的名字查（两者可能不完全一样）。
+        wanted = (senders or {}).get(chat["name"]) or (senders or {}).get(name) or []
         for item in raw:
+            if not sender_hit(item["sender"], wanted):
+                continue
             messages.append(
                 {
                     "source": chat["name"] or name,
@@ -562,6 +589,8 @@ def collect(chats: list[str], days: int = 1) -> tuple[list[dict], list[str]]:
                     "id": item["id"],
                 }
             )
+        if wanted:
+            warnings.append(f"飞书群「{chat['name'] or name}」只看 {'、'.join(wanted)} 发的话")
     return messages, warnings
 
 

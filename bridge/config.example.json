@@ -4,7 +4,7 @@
     "enabled": true,
     "sessions": [
       "示例群 A",
-      "示例群 B"
+      "示例群 B|只看的人,另一个人"
     ],
     "max_messages": 60,
     "days": 1
@@ -13,7 +13,8 @@
     "enabled": true,
     "mode": "sdk",
     "chats": [
-      "示例飞书群"
+      "示例飞书群",
+      "另一个飞书群|只看的人"
     ],
     "days": 1,
     "window": "飞书",

@@ -9,6 +9,7 @@ import {
   loadBridge,
   loadProfile,
   loadRemoteBridge,
+  recordSpeakers,
   saveBridge,
   startFeishuLogin,
   type BridgeConfig,
@@ -336,6 +337,8 @@ export function PlanDialog({ open, courses, onClose, onApply }: Props) {
         })
         return
       }
+      // 记下每个群里都有谁说过话：设置页要按人缩小范围，手打名字容易错。
+      recordSpeakers(messages)
       // 只有剪贴板那一路是「一整块文本」，需要按行拆。
       // 结构化来源（微信、飞书接口）每条消息自带发送人和日期，再按行拆会把
       // 一条通知里的「1.… 2.… 3.…」拆成三条日程，纯属制造噪音。
@@ -600,7 +603,7 @@ export function PlanDialog({ open, courses, onClose, onApply }: Props) {
                       {item.location ? ` · ${item.location}` : ''}
                       {item.deadline ? ` · 截止 ${item.deadline}` : ''}
                       {' · '}
-                      {[item.channel, item.source].filter(Boolean).join(' · ')}
+                      {[item.channel, item.source, item.sender].filter(Boolean).join(' · ')}
                     </div>
                     <div className="small muted" style={{ marginTop: 2 }}>
                       {item.reason}
