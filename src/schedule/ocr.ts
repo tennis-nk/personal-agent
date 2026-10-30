@@ -191,6 +191,27 @@ function withHeaderIfMissing(text: string): string {
   return `${OCR_COLUMNS}\n${text}`
 }
 
+/** 把已经是 data URL 的图再缩一档。图越小，推理型模型花在「看图思考」上的预算越少。 */
+async function shrinkDataUrl(dataUrl: string, maxSide: number): Promise<string> {
+  const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const element = new Image()
+    element.onload = () => resolve(element)
+    element.onerror = () => reject(new Error('缩图失败，换个浏览器试试。'))
+    element.src = dataUrl
+  })
+  const scale = Math.min(1, maxSide / Math.max(image.width, image.height))
+  if (scale >= 1) return dataUrl
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.max(1, Math.round(image.width * scale))
+  canvas.height = Math.max(1, Math.round(image.height * scale))
+  const context = canvas.getContext('2d')
+  if (!context) return dataUrl
+  context.fillStyle = '#ffffff'
+  context.fillRect(0, 0, canvas.width, canvas.height)
+  context.drawImage(image, 0, 0, canvas.width, canvas.height)
+  return canvas.toDataURL('image/jpeg', 0.82)
+}
+
 /** 调视觉模型读课表。settings 不传就读用户当前的配置。 */
 export async function recognizeTimetable(
   dataUrl: string,
@@ -201,22 +222,38 @@ export async function recognizeTimetable(
     throw new Error('还没配好模型。到设置页填上 API Key，识图模型填一个带视觉的型号（如 deepseek-flash）。')
   }
 
-  // 一份课表能到十几门课、每门一行六字段，预算给小了会被截断；而推理模型
-  // 把预算花在思考上时 content 直接是空的，看起来就像「模型什么都没读出来」。
-  // 所以先给 4096，被截断了再翻倍重试一次，别让用户自己猜。
-  const ask = (maxTokens: number) =>
-    visionChat(vision, { prompt: TIMETABLE_PROMPT, images: [dataUrl], temperature: 0, maxTokens })
+  // 一份课表能到十几门课、每门一行六字段，预算给小了会被截断；而推理型视觉模型
+  // 会把预算先花在「思考」上（实测有 8000 token 全用来思考、一个字没吐的），
+  // 所以按「加预算 → 再把图缩小」的顺序试三档，别让用户自己猜。
+  const plans: { tokens: number; side: number }[] = [
+    { tokens: 4096, side: 0 },
+    { tokens: 8192, side: 0 },
+    { tokens: 8192, side: 1400 },
+  ]
 
-  let raw: string
-  try {
-    raw = await ask(4096)
-  } catch (error) {
-    if (error instanceof LlmError && error.code === 'truncated') {
-      raw = await ask(8192)
-    } else {
+  let raw = ''
+  let lastError: unknown = null
+  for (const plan of plans) {
+    const source = plan.side > 0 ? await shrinkDataUrl(dataUrl, plan.side) : dataUrl
+    try {
+      raw = await visionChat(vision, {
+        prompt: TIMETABLE_PROMPT,
+        images: [source],
+        temperature: 0,
+        maxTokens: plan.tokens,
+      })
+      break
+    } catch (error) {
+      // 只有「被截断」值得换一档重试；网络、鉴权、不收图之类的错误重试也没用。
+      if (error instanceof LlmError && error.code === 'truncated') {
+        lastError = error
+        continue
+      }
       throw error
     }
   }
+
+  if (!raw) throw lastError ?? new Error('识图没有返回内容。')
 
   if (/NOT_TIMETABLE/.test(raw)) {
     return {

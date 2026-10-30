@@ -261,7 +261,7 @@ export function describeLlmError(error: unknown): string {
       case 'vision_unsupported':
         return `${error.message}｜多半是当前模型不收图片。DeepSeek 要填 deepseek-flash，其他服务商要填带视觉的型号（glm-4v-flash / qwen-vl-max / gpt-4o-mini），在设置页的「识图模型」里改。`
       case 'truncated':
-        return `${error.message}｜换更短的图，或把设置页的识图模型换成不带推理的视觉型号。`
+        return `${error.message}｜这个型号是「先想很久再说话」的那种，读表格经常把预算全花在思考上。换一个不做长推理的视觉型号最省事（glm-4v-flash 有免费额度，或 qwen-vl-max / gpt-4o-mini），设置页的识图模型一栏可以直接切。`
       case 'empty_content':
         return `${error.message}｜这个型号看到了图但没吐字：要么它不是视觉模型，要么图里字太小看不清。把「识图模型」改成 deepseek-flash，截图时只框课表那块（别整屏截）再试。`
       default:
