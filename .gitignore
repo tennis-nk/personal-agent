@@ -1,0 +1,43 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# 本机私有配置和凭据 —— 这些永远不进仓库
+bridge/config.json
+bridge/feishu_auth.json
+bridge/@AutomationLog.txt
+bridge/wxauto_logs/
+wxauto_logs/
+*.local.json
+
+# 个人数据
+docs/课表-*.txt
+shots/
+
+# 只在这台机子上用的调试探针
+seed.ts
+seed.html
+
+.workbuddy/
+

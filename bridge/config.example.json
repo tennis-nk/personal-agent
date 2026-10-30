@@ -1,0 +1,22 @@
+{
+  "port": 8787,
+  "wechat": {
+    "enabled": true,
+    "sessions": ["示例群 A", "示例群 B"],
+    "max_messages": 60,
+    "days": 1
+  },
+  "feishu": {
+    "enabled": true,
+    "mode": "sdk",
+    "chats": ["示例飞书群"],
+    "days": 1,
+    "window": "飞书",
+    "use_clipboard": true
+  },
+  "llm": {
+    "upstream": "http://127.0.0.1:11434/v1",
+    "api_key": "",
+    "timeout": 180
+  }
+}
