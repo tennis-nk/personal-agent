@@ -1,4 +1,95 @@
 import { resolveEndpoint, type LlmSettings } from './settings'
+import { loadBridge } from '../data/profile'
+
+/**
+ * 这些域名实测会给浏览器回跨域头（Access-Control-Allow-Origin: null 或 *），
+ * 从 file:// 打开也能直连。别的不一定——智谱就完全不回，前端只能报「连不上」。
+ * 这里只用来决定报错时该说什么，不参与请求。
+ */
+const CORS_OK_HOSTS = new Set([
+  'api.deepseek.com',
+  'api.moonshot.cn',
+  'api.siliconflow.cn',
+  'dashscope.aliyuncs.com',
+  'ark.cn-beijing.volces.com',
+])
+
+function hostOf(endpoint: string): string {
+  try {
+    return new URL(endpoint).hostname
+  } catch {
+    return endpoint
+  }
+}
+
+/**
+ * 发一次模型请求，直连不通就经本机助手转发一次。
+ *
+ * 为什么要转发：页面是 file:// 打开的，Origin 是 null。浏览器在发
+ * POST + Authorization 之前会先发 OPTIONS 预检，服务商不回跨域头就直接拦死，
+ * fetch 抛 TypeError，前端只看得到「连不上」——其实网络是通的，是浏览器不让发。
+ * 经 127.0.0.1:8787/proxy 转发，浏览器只跟本机说话，跨域这回事就没了。
+ */
+async function postChat(
+  endpoint: string,
+  body: Record<string, unknown>,
+  apiKey: string,
+  signal?: AbortSignal,
+): Promise<Response> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  // 没填 Key 就别塞一个空的 Bearer 进去，个别网关会因此报 401 而不是「缺鉴权」。
+  if (apiKey.trim()) headers.Authorization = `Bearer ${apiKey.trim()}`
+  const payload = JSON.stringify(body)
+
+  try {
+    return await fetch(endpoint, { method: 'POST', headers, body: payload, ...(signal ? { signal } : {}) })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
+    // 直连失败：多半是被跨域拦了。落到下面的转发。
+  }
+
+  const { port } = loadBridge()
+  const relayUrl = `http://127.0.0.1:${port}/proxy?url=${encodeURIComponent(endpoint)}`
+  let relayed: Response
+  try {
+    relayed = await fetch(relayUrl, { method: 'POST', headers, body: payload })
+  } catch {
+    throw new LlmError(networkHint(endpoint, ''), 'network_failed')
+  }
+  // 本机助手自己的报错（地址不在白名单、上游连不上）是普通 JSON，没这个头。
+  // 有它才说明这是上游的真实回答，4xx/5xx 也该按上游的意思解释。
+  if (relayed.headers.get('x-relay') !== '1') {
+    throw new LlmError(networkHint(endpoint, relayDetail(await relayed.text().catch(() => ''))), 'network_failed')
+  }
+  return relayed
+}
+
+/** 本机助手的 502 里带着具体原因（比如上游连接被拒），别丢掉。 */
+function relayDetail(body: string): string {
+  try {
+    const parsed = JSON.parse(body) as { error?: string }
+    return parsed.error ?? body.slice(0, 160)
+  } catch {
+    return body.slice(0, 160)
+  }
+}
+
+function networkHint(endpoint: string, detail: string): string {
+  const host = hostOf(endpoint)
+  if (detail) {
+    return `连不上模型接口（${host}）。本机助手转发也失败了：${detail}`
+  }
+  if (!CORS_OK_HOSTS.has(host)) {
+    return (
+      `连不上模型接口（${host}）。这个域名不给浏览器跨域，从本机文件打开的页面发不出去，` +
+      '只能经本机助手转发——而它现在没在跑。双击「启动信息管家.bat」把助手起来，再点一次。'
+    )
+  }
+  return (
+    `连不上模型接口（${host}）。直连和经本机助手转发都失败了：` +
+    '先确认网络能通（代理、VPN），再看设置里的接口地址有没有写错。'
+  )
+}
 
 export type ChatMessage =
   | { role: 'system'; content: string }
@@ -32,9 +123,6 @@ export interface LlmStreamOptions {
  */
 export async function streamChat(settings: LlmSettings, options: LlmStreamOptions): Promise<string> {
   const endpoint = resolveEndpoint(settings.baseUrl)
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  // 没填 Key 就别塞一个空的 Bearer 进去，个别网关会因此报 401 而不是「缺鉴权」。
-  if (settings.apiKey.trim()) headers.Authorization = `Bearer ${settings.apiKey.trim()}`
 
   const body: Record<string, unknown> = {
     model: settings.model.trim(),
@@ -44,22 +132,7 @@ export async function streamChat(settings: LlmSettings, options: LlmStreamOption
   if (options.json && settings.jsonMode) body.response_format = { type: 'json_object' }
   if (options.temperature !== undefined) body.temperature = options.temperature
 
-  let response: Response
-  try {
-    response = await fetch(endpoint, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      ...(options.signal ? { signal: options.signal } : {}),
-    })
-  } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') throw error
-    // fetch 只在网络层失败时抛错，浏览器直连第三方接口最常见的原因就是 CORS。
-    throw new LlmError(
-      '连不上模型接口。多半是该服务商不允许浏览器直连（跨域限制），可以换一家，或在设置里改用支持跨域的网关地址。',
-      'network_failed',
-    )
-  }
+  const response = await postChat(endpoint, body, settings.apiKey, options.signal)
 
   if (!response.ok) {
     throw new LlmError(await readError(response), classifyStatus(response.status))
@@ -175,24 +248,7 @@ export async function visionChat(settings: LlmSettings, options: VisionOptions):
   if (options.temperature !== undefined) body.temperature = options.temperature
   if (options.maxTokens !== undefined) body.max_tokens = options.maxTokens
 
-  let response: Response
-  try {
-    response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(settings.apiKey.trim() ? { Authorization: `Bearer ${settings.apiKey.trim()}` } : {}),
-      },
-      body: JSON.stringify(body),
-      ...(options.signal ? { signal: options.signal } : {}),
-    })
-  } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') throw error
-    throw new LlmError(
-      '连不上模型接口。多半是该服务商不允许浏览器直连（跨域限制），可以换一家，或在设置里改用支持跨域的网关地址。',
-      'network_failed',
-    )
-  }
+  const response = await postChat(endpoint, body, settings.apiKey, options.signal)
 
   if (!response.ok) {
     const detail = await readError(response)

@@ -93,14 +93,16 @@ export const VISION_PRESETS: Preset[] = [
     name: '智谱 GLM-4V',
     baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
     model: 'glm-4v-flash',
-    hint: 'glm-4v-flash 免费、不做长推理，适合读表格。若提示模型不存在，把型号改成 glm-4.6v-flash',
+    hint:
+      '免费、不做长推理，适合读表格。它的接口不回跨域头，浏览器直连会被拦，' +
+      '要经本机助手转发（双击「启动信息管家.bat」）。若提示模型不存在，把型号改成 glm-4.6v-flash',
   },
   {
     id: 'qwen-vl',
     name: '通义千问 VL',
     baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
     model: 'qwen-vl-max',
-    hint: '阿里云 DashScope 兼容模式',
+    hint: '浏览器可直连，不用本机助手。新账号有免费 token 额度',
   },
   {
     id: 'siliconflow-vl',
