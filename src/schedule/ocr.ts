@@ -7,7 +7,7 @@
  * 在人眼下一秒就能发现，落进日历后要查一学期。
  */
 
-import { LlmError, visionChat } from '../ai/llm'
+import { LlmError, visionChat, visionTokenCap } from '../ai/llm'
 import { isReady, loadSettings, resolveVision, type LlmSettings } from '../ai/settings'
 import { parseTimetable } from './parse'
 
@@ -225,11 +225,15 @@ export async function recognizeTimetable(
   // 一份课表能到十几门课、每门一行六字段，预算给小了会被截断；而推理型视觉模型
   // 会把预算先花在「思考」上（实测有 8000 token 全用来思考、一个字没吐的），
   // 所以按「加预算 → 再把图缩小」的顺序试三档，别让用户自己猜。
-  const plans: { tokens: number; side: number }[] = [
-    { tokens: 4096, side: 0 },
-    { tokens: 8192, side: 0 },
-    { tokens: 8192, side: 1400 },
-  ]
+  // 但这家的硬上限得认（智谱 glm-4v-flash 只收 1024），超过上限是直接 400，
+  // 所以先按已知上限压一压，再把重复的档去掉。
+  const cap = visionTokenCap(vision.baseUrl)
+  const budget = (want: number) => (cap ? Math.min(want, cap) : want)
+  const plans = [
+    { tokens: budget(4096), side: 0 },
+    { tokens: budget(8192), side: 0 },
+    { tokens: budget(8192), side: 1400 },
+  ].filter((plan, index, all) => all.findIndex((item) => item.tokens === plan.tokens && item.side === plan.side) === index)
 
   let raw = ''
   let lastError: unknown = null

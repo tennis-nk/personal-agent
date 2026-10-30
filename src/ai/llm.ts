@@ -228,6 +228,39 @@ export interface VisionOptions {
 }
 
 /**
+ * 各家的 max_tokens 上限不一样，而且不会写在文档的显眼处：
+ * 智谱 glm-4v-flash 只收 1~1024，超一个数就 400「max_tokens参数非法」。
+ * 撞过一次就把上限按域名记下来，后面的请求直接按上限发。
+ */
+const TOKEN_CAPS = new Map<string, number>()
+
+/** 已经知道的上限。识图那边用它算预算，免得明知不可为还往上加。 */
+export function visionTokenCap(baseUrl: string): number | undefined {
+  return TOKEN_CAPS.get(hostOf(resolveEndpoint(baseUrl)))
+}
+
+/** 从「限制数值范围[1,1024]」这类话里把上限抠出来。 */
+function capFromMessage(detail: string): number | null {
+  const match = detail.match(/max_tokens[^0-9]*\[?\s*\d+\s*,\s*(\d+)/i)
+  if (!match) return null
+  const value = Number(match[1])
+  return Number.isFinite(value) && value > 0 ? value : null
+}
+
+/** 记下这家真正的上限，返回「该按多少重发」；已经按上限发过就返回 null。 */
+function lowerTokenCap(endpoint: string, detail: string, current?: number): number | null {
+  if (!/max_tokens/i.test(detail)) return null
+  const found = capFromMessage(detail)
+  if (!found) return null
+  const host = hostOf(endpoint)
+  const known = TOKEN_CAPS.get(host)
+  if (known !== undefined && known <= found) return null
+  TOKEN_CAPS.set(host, found)
+  if (current !== undefined && current <= found) return null
+  return found
+}
+
+/**
  * 识图：一次性取回整段答案（不流式）。
  *
  * 图片走 OpenAI 的 content 数组格式，各家通用；流式在这里没意义，
@@ -246,17 +279,32 @@ export async function visionChat(settings: LlmSettings, options: VisionOptions):
     stream: false,
   }
   if (options.temperature !== undefined) body.temperature = options.temperature
-  if (options.maxTokens !== undefined) body.max_tokens = options.maxTokens
+  const knownCap = TOKEN_CAPS.get(hostOf(endpoint))
+  if (options.maxTokens !== undefined) {
+    body.max_tokens = knownCap ? Math.min(options.maxTokens, knownCap) : options.maxTokens
+  }
 
-  const response = await postChat(endpoint, body, settings.apiKey, options.signal)
+  let response = await postChat(endpoint, body, settings.apiKey, options.signal)
 
   if (!response.ok) {
-    const detail = await readError(response)
-    // 纯文本模型收到图片基本都是 400，先按「不收图片」给提示，比让用户读原始报错有用。
-    if (response.status === 400 || response.status === 422) {
-      throw new LlmError(detail, 'vision_unsupported')
+    let detail = await readError(response)
+    // 400 有时不是「不收图」，而是 max_tokens 超了这家允许的范围。
+    // 这种错误是自解释的，把上限记下来、按上限重发一次，比让用户自己翻文档强。
+    const cap = lowerTokenCap(endpoint, detail, body.max_tokens as number | undefined)
+    if (cap !== null) {
+      body.max_tokens = cap
+      response = await postChat(endpoint, body, settings.apiKey, options.signal)
+      if (!response.ok) detail = await readError(response)
     }
-    throw new LlmError(detail, classifyStatus(response.status))
+    if (!response.ok) {
+      const paramIssue = /max_tokens|temperature|invalid|参数|范围/i.test(detail)
+      if (paramIssue) throw new LlmError(detail, 'request_failed')
+      // 纯文本模型收到图片基本都是 400，先按「不收图片」给提示，比让用户读原始报错有用。
+      if (response.status === 400 || response.status === 422) {
+        throw new LlmError(detail, 'vision_unsupported')
+      }
+      throw new LlmError(detail, classifyStatus(response.status))
+    }
   }
 
   const payload = (await response.json()) as {
@@ -306,6 +354,8 @@ export function describeLlmError(error: unknown): string {
     switch (error.code) {
       case 'auth_failed':
         return `${error.message}｜请检查设置里的 API Key 是否正确、是否已过期。`
+      case 'request_failed':
+        return `${error.message}｜接口不认这次请求的参数：多半是这个型号对参数有更严的限制（比如 max_tokens 上限），或者「识图模型」填成了文本型号。`
       case 'not_found':
         return `${error.message}｜请检查接口地址和模型名是否填对。`
       case 'rate_limited':
