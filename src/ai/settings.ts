@@ -12,6 +12,11 @@ export interface LlmSettings {
   visionModel: string
   /** 识图用的接口地址。换一家服务商识图时才需要填。 */
   visionBaseUrl: string
+  /**
+   * 识图专用的 Key。留空就复用 apiKey。
+   * 文本用 DeepSeek、识图换智谱时，两家的 Key 不一样，共用一栏必然有一边 401。
+   */
+  visionApiKey: string
 }
 
 export interface Preset {
@@ -88,7 +93,7 @@ export const VISION_PRESETS: Preset[] = [
     name: '智谱 GLM-4V',
     baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
     model: 'glm-4v-flash',
-    hint: '有免费额度',
+    hint: 'glm-4v-flash 免费、不做长推理，适合读表格。若提示模型不存在，把型号改成 glm-4.6v-flash',
   },
   {
     id: 'qwen-vl',
@@ -142,6 +147,7 @@ export const DEFAULT_SETTINGS: LlmSettings = {
   jsonMode: false,
   visionModel: '',
   visionBaseUrl: '',
+  visionApiKey: '',
 }
 
 /** 识图时实际用的配置：没单独填就整套复用文本模型。 */
@@ -150,6 +156,7 @@ export function resolveVision(settings: LlmSettings): LlmSettings {
     ...settings,
     baseUrl: settings.visionBaseUrl.trim() || settings.baseUrl,
     model: settings.visionModel.trim() || settings.model,
+    apiKey: settings.visionApiKey.trim() || settings.apiKey,
   }
 }
 
@@ -172,6 +179,7 @@ export function loadSettings(): LlmSettings {
       jsonMode: parsed.jsonMode === true,
       visionModel: typeof parsed.visionModel === 'string' ? parsed.visionModel : '',
       visionBaseUrl: typeof parsed.visionBaseUrl === 'string' ? parsed.visionBaseUrl : '',
+      visionApiKey: typeof parsed.visionApiKey === 'string' ? parsed.visionApiKey : '',
     }
   } catch {
     return { ...DEFAULT_SETTINGS }

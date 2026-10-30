@@ -577,6 +577,15 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
                 onChange={(event) => update({ visionBaseUrl: event.target.value })}
               />
             </div>
+            <div className="field">
+              <input
+                className="input"
+                type="password"
+                value={settings.visionApiKey}
+                placeholder="识图 Key（留空则复用上面的 Key；识图换别家时必填）"
+                onChange={(event) => update({ visionApiKey: event.target.value })}
+              />
+            </div>
             <div className="small muted">
               {`识图现在用：${vision.model}${vision.inherited ? '（和文本模型同一家）' : '（单独配置）'}。`}
             </div>
