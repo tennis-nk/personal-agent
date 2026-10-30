@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { isModelReady } from '../ai/agent'
-import { describeLlmError, testConnection } from '../ai/llm'
+import { describeLlmError, testConnection, visionChat } from '../ai/llm'
 import {
   PRESETS,
   VISION_PRESETS,
   DEFAULT_SETTINGS,
   isReady,
+  resolveVision,
   visionTarget,
   notifyLlmChanged,
   loadSettings,
@@ -44,6 +45,10 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
   const [settings, setSettings] = useState<LlmSettings>(() => loadSettings())
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState('')
+  /** 识图连通性自检：发一张自造的图，看模型到底读不读得出来。 */
+  const [visionTesting, setVisionTesting] = useState(false)
+  const [visionTestMsg, setVisionTestMsg] = useState('')
+  const [visionTestOk, setVisionTestOk] = useState(false)
   /** 上一次改动有没有写进浏览器；null 表示这次还没动过。 */
   const [saveState, setSaveState] = useState<{ ok: boolean; at: Date } | null>(null)
   const [dataMessage, setDataMessage] = useState('')
@@ -383,6 +388,53 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
     })
   }
 
+  /**
+   * 识图自检。
+   *
+   * 用 canvas 现场画一张 640×180 的白底黑字图，问模型上面写了什么。
+   * 这样能把两种失败分开：图是程序生成的、必然清晰，如果它还读不出来，
+   * 问题在模型或接口那边；读得出来，那之前就是截图太糊或框得太大。
+   */
+  async function handleVisionTest(): Promise<void> {
+    setVisionTesting(true)
+    setVisionTestMsg('')
+    setVisionTestOk(false)
+    try {
+      const canvas = document.createElement('canvas')
+      canvas.width = 640
+      canvas.height = 180
+      const context = canvas.getContext('2d')
+      if (!context) throw new Error('浏览器画不出测试图，换个浏览器试试。')
+      context.fillStyle = '#ffffff'
+      context.fillRect(0, 0, canvas.width, canvas.height)
+      context.fillStyle = '#111111'
+      context.font = 'bold 40px "Microsoft YaHei", sans-serif'
+      context.fillText('周一 第1-2节', 40, 70)
+      context.fillText('高等数学', 40, 135)
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.9)
+
+      const reply = await visionChat(resolveVision(settings), {
+        prompt: '这张图上写了什么？只回答图上的文字，不要解释。',
+        images: [dataUrl],
+        temperature: 0,
+        maxTokens: 200,
+      })
+      const text = reply.replace(/\s+/g, ' ').trim()
+      const hit = /周一|高等数学/.test(text)
+      setVisionTestOk(hit)
+      setVisionTestMsg(
+        hit
+          ? `识图通了，模型读出：「${text.slice(0, 60)}」。之前读不出大概是截图字太小或框得太大。`
+          : `模型有回应但没读出图上的字：「${text.slice(0, 80) || '（空）'}」。这个型号多半不是视觉模型。`,
+      )
+    } catch (error) {
+      setVisionTestOk(false)
+      setVisionTestMsg(describeLlmError(error))
+    } finally {
+      setVisionTesting(false)
+    }
+  }
+
   async function handleTest(): Promise<void> {
     setTesting(true)
     setTestResult('')
@@ -549,6 +601,23 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
                 </button>
               ))}
             </div>
+            <div className="row wrap" style={{ marginTop: 10, gap: 8 }}>
+              <button
+                className="btn ghost small"
+                onClick={() => void handleVisionTest()}
+                disabled={visionTesting}
+              >
+                {visionTesting ? '测试中…' : '测试识图'}
+              </button>
+              <span className="small muted">
+                发一张程序生成的小图（白底黑字），看模型能不能读出来——用来区分「模型不看图」和「你的截图太糊」。
+              </span>
+            </div>
+            {visionTestMsg ? (
+              <div className={`small ${visionTestOk ? '' : ''}`} style={{ marginTop: 4, color: visionTestOk ? 'var(--green)' : 'var(--red)' }}>
+                {visionTestMsg}
+              </div>
+            ) : null}
           </div>
 
           <label className="row">

@@ -204,7 +204,13 @@ function Shell() {
             </button>
           ))}
         </nav>
-        <div className="sidebar-foot">数据保存在本机浏览器 · 单机自用</div>
+        <div className="sidebar-foot">
+          数据保存在本机浏览器 · 单机自用
+          <br />
+          <span title="改完代码重新构建后这个时间会变，据此确认浏览器有没有加载到新版">
+            构建 {typeof __BUILD_TIME__ === 'string' ? __BUILD_TIME__ : '开发模式'}
+          </span>
+        </div>
       </aside>
 
       <main className="main">

@@ -237,7 +237,10 @@ export async function visionChat(settings: LlmSettings, options: VisionOptions):
   if (reason === 'length') {
     throw new LlmError(`模型输出被长度限制截断了（${facts}）`, 'truncated')
   }
-  throw new LlmError(`模型返回了空内容（${facts}）`, 'empty_content')
+  // 带上返回体前 160 字：万一网关给的不是标准结构（没有 choices 之类），
+  // 有这段原文才查得下去。
+  const shape = JSON.stringify(payload).slice(0, 160)
+  throw new LlmError(`模型返回了空内容（${facts}；返回体 ${shape}）`, 'empty_content')
 }
 
 /** 把各种失败翻译成用户看得懂的一句话，顺带给出下一步动作。 */
