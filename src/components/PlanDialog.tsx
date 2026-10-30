@@ -4,10 +4,13 @@ import type { CourseRow } from '../data/types'
 import {
   activateApp,
   clampDays,
-  fetchToday,
+  fetchFeishuStatus,
+  fetchTodayReport,
   loadBridge,
   loadProfile,
+  loadRemoteBridge,
   saveBridge,
+  startFeishuLogin,
   type BridgeConfig,
 } from '../data/profile'
 import {
@@ -59,9 +62,16 @@ function defaultDecision(item: NoticeItem): Decision {
   return item.needConfirm ? 'later' : 'go'
 }
 
+/** 渠道标签：微信绿、飞书蓝，粘贴进来的不打标签（只有群名）。 */
+function channelTag(channel: string): { text: string; className: string } | null {
+  if (channel === '微信') return { text: '微信', className: 'tag green' }
+  if (channel === '飞书') return { text: '飞书', className: 'tag blue' }
+  return null
+}
+
 function buildTodo(item: NoticeItem, decision: Decision): TodoInput {
   const lines = [
-    `来源：${item.source}${item.sender ? ` · ${item.sender}` : ''}`,
+    `来源：${[item.channel, item.source].filter(Boolean).join(' · ')}${item.sender ? ` · ${item.sender}` : ''}`,
     item.location ? `地点：${item.location}` : null,
     item.deadline ? `报名/提交截止：${item.deadline}` : null,
     `原文：${item.raw}`,
@@ -124,7 +134,107 @@ export function PlanDialog({ open, courses, onClose, onApply }: Props) {
   const [showOther, setShowOther] = useState(false)
   /** 与身份无关、又没认岀时间的闲聊，解析时就被丢掉了，这里只记条数。 */
   const [skipped, setSkipped] = useState(0)
+  /** 本机助手带回来的抱怨：微信没读成、剪贴板是空的、飞书没授权。 */
+  const [warnings, setWarnings] = useState<string[]>([])
+  /**
+   * 飞书授权提醒。null 表示不用管（没开直读、或授权还新鲜）。
+   * 只有「直读群消息」这条路径依赖授权，剪贴板模式不用登录。
+   */
+  const [feishuAuth, setFeishuAuth] = useState<{ message: string; url: string; busy: boolean } | null>(null)
+  const feishuPoll = useRef<number | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
+
+  function stopFeishuPoll(): void {
+    if (feishuPoll.current !== null) {
+      window.clearInterval(feishuPoll.current)
+      feishuPoll.current = null
+    }
+  }
+
+  /** 开弹窗时先看一眼飞书授权还在不在，掉了对着空列表点读取是浪费时间。 */
+  async function checkFeishuAuth(): Promise<void> {
+    if (!bridge.enabled) {
+      setFeishuAuth(null)
+      return
+    }
+    try {
+      const remote = await loadRemoteBridge(bridge)
+      const section = remote?.feishu
+      if (!section?.enabled || section.mode !== 'sdk') {
+        setFeishuAuth(null)
+        return
+      }
+      const status = await fetchFeishuStatus(bridge)
+      if (!status.ok || !status.app_ready) {
+        setFeishuAuth(null)
+        return
+      }
+      if (!status.logged_in) {
+        setFeishuAuth({ message: '飞书授权掉了，直读群消息读不到飞书内容。重新授权一次就好。', url: '', busy: false })
+        return
+      }
+      // 没有 refresh token 的授权过期即失效，快到点的时候先提醒，别等到读不出来才发现。
+      if (!status.has_refresh && status.expires_in <= 1800) {
+        const minutes = Math.max(1, Math.round(status.expires_in / 60))
+        setFeishuAuth({
+          message: `飞书授权还剩约 ${minutes} 分钟，而且不能自动续期。现在重新授权一次，省得读到一半断掉。`,
+          url: '',
+          busy: false,
+        })
+        return
+      }
+      setFeishuAuth(null)
+    } catch {
+      // 助手没开或刚好重启，下次再问。
+      setFeishuAuth(null)
+    }
+  }
+
+  async function handleFeishuLogin(): Promise<void> {
+    setFeishuAuth((prev) => (prev ? { ...prev, busy: true } : prev))
+    try {
+      const result = await startFeishuLogin(bridge)
+      if (!result.ok || !result.url) {
+        setFeishuAuth((prev) =>
+          prev ? { ...prev, busy: false, message: result.error || '发起授权失败，确认本机助手在运行' } : prev,
+        )
+        return
+      }
+      setFeishuAuth((prev) =>
+        prev
+          ? {
+              ...prev,
+              busy: false,
+              url: result.url,
+              message: '用飞书扫下面的二维码，或在浏览器里打开链接确认。确认后这里会自动消失。',
+            }
+          : prev,
+      )
+      stopFeishuPoll()
+      const startedAt = Date.now()
+      feishuPoll.current = window.setInterval(() => {
+        void (async () => {
+          try {
+            const status = await fetchFeishuStatus(bridge)
+            if (status.logged_in) {
+              stopFeishuPoll()
+              setFeishuAuth(null)
+              setNote({ text: '飞书授权好了，可以再点一次「从本机助手读取」。', kind: 'ok' })
+            } else if (Date.now() - startedAt > 10 * 60 * 1000) {
+              stopFeishuPoll()
+              setFeishuAuth((prev) => (prev ? { ...prev, busy: false, message: '授权超时了，再点一次「扫码授权」。' } : prev))
+            }
+          } catch {
+            // 轮询期间助手重启过，下一轮再试。
+          }
+        })()
+      }, 3000)
+    } catch (error) {
+      setFeishuAuth((prev) =>
+        prev ? { ...prev, busy: false, message: `发起授权失败：${error instanceof Error ? error.message : '未知错误'}` } : prev,
+      )
+    }
+  }
 
   function changeDays(next: number): void {
     const value = clampDays(next)
@@ -144,7 +254,14 @@ export function PlanDialog({ open, courses, onClose, onApply }: Props) {
     setNote(null)
     setSkipped(0)
     setShowOther(false)
+    setWarnings([])
+    setFeishuAuth(null)
+    stopFeishuPoll()
+    if (bridge.enabled) void checkFeishuAuth()
   }, [open, bridge.enabled])
+
+  // 弹窗关掉就别再轮询授权状态了。
+  useEffect(() => stopFeishuPoll, [])
 
   // 已经过去的不再问「去不去」，问了也没意义。
   // 别人的事不逐个问，问了也是白问。
@@ -156,6 +273,15 @@ export function PlanDialog({ open, courses, onClose, onApply }: Props) {
   const expiredCount = useMemo(() => items.filter((item) => item.expired).length, [items])
   const otherCount = useMemo(() => items.filter((item) => item.relevance === 'other').length, [items])
   const mineCount = useMemo(() => items.filter((item) => item.relevance === 'mine').length, [items])
+  /** 「微信 4 条 · 飞书 2 条」，让人一眼看出这批消息是从哪儿来的。 */
+  const channelSummary = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const item of items) {
+      const key = item.channel || (source === '手动粘贴' ? '手动粘贴' : '本机助手')
+      counts.set(key, (counts.get(key) ?? 0) + 1)
+    }
+    return [...counts.entries()].map(([name, count]) => `${name} ${count} 条`).join(' · ')
+  }, [items, source])
   /** 预览里实际列出来的条目：过期的不显示（可选），别人的事不显示（可选）。 */
   const visible = useMemo(() => {
     let list = hideExpired ? items.filter((item) => !item.expired) : items
@@ -195,10 +321,17 @@ export function PlanDialog({ open, courses, onClose, onApply }: Props) {
     setFetching(true)
     setNote(null)
     try {
-      const messages = await fetchToday(bridge, days)
+      const report = await fetchTodayReport(bridge, days)
+      const messages = report.messages
+      setWarnings(report.warnings)
+      // 读的时候才发现授权掉了（比如刚才还有几分钟过期）：把提示顶上去。
+      if (report.warnings.some((line) => /授权|登录|token/i.test(line))) void checkFeishuAuth()
       if (messages.length === 0) {
         setNote({
-          text: `本机助手连上了，但最近 ${days} 天没抓到消息。确认微信已登录、飞书里的总结已复制，或直接粘贴。`,
+          text:
+            report.warnings.length > 0
+              ? `本机助手连上了，但一条消息都没读到：${report.warnings.join('；')}`
+              : `本机助手连上了，但最近 ${days} 天没抓到消息。确认微信已登录、飞书里的总结已复制，或直接粘贴。`,
           kind: 'error',
         })
         return
@@ -363,6 +496,31 @@ export function PlanDialog({ open, courses, onClose, onApply }: Props) {
                 </div>
               ) : null}
 
+              {feishuAuth ? (
+                <div className="notice error" style={{ marginBottom: 8 }}>
+                  <div className="row wrap" style={{ justifyContent: 'space-between', gap: 8 }}>
+                    <span>{feishuAuth.message}</span>
+                    <button className="btn small" disabled={feishuAuth.busy} onClick={() => void handleFeishuLogin()}>
+                      {feishuAuth.busy ? '正在申请…' : '扫码授权'}
+                    </button>
+                  </div>
+                  {feishuAuth.url ? (
+                    <div className="small" style={{ marginTop: 6, wordBreak: 'break-all' }}>
+                      授权链接：
+                      <a href={feishuAuth.url} target="_blank" rel="noreferrer">
+                        {feishuAuth.url}
+                      </a>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+
+              {warnings.length > 0 ? (
+                <div className="small muted" style={{ marginBottom: 8 }}>
+                  本机助手提示：{warnings.join('；')}
+                </div>
+              ) : null}
+
               <textarea
                 className="textarea mono"
                 style={{ minHeight: 150 }}
@@ -384,7 +542,14 @@ export function PlanDialog({ open, courses, onClose, onApply }: Props) {
               <div className="small muted" style={{ marginBottom: 6 }}>
                 按你的身份筛过：共 {items.length} 条，与你有关 {mineCount} 条
                 {skipped > 0 ? `；另有 ${skipped} 条无关闲聊没有列出来` : ''}
+                {channelSummary ? ` · 来源：${channelSummary}` : ''}
               </div>
+
+              {warnings.length > 0 ? (
+                <div className="small muted" style={{ marginBottom: 6 }}>
+                  本机助手提示：{warnings.join('；')}
+                </div>
+              ) : null}
 
               {otherCount > 0 ? (
                 <label className="check-line plan-filter">
@@ -420,10 +585,12 @@ export function PlanDialog({ open, courses, onClose, onApply }: Props) {
 
               {visible.map((item) => {
                 const decision = decisions[item.id] ?? defaultDecision(item)
+                const channel = channelTag(item.channel)
                 return (
                   <div className={`plan-item${item.expired ? ' expired' : ''}`} key={item.id}>
                     <div className="plan-item-head">
                       <span className="plan-item-title">{item.title}</span>
+                      {channel ? <span className={channel.className}>{channel.text}</span> : null}
                       {item.expired ? <span className="tag">已过期</span> : null}
                       {item.needConfirm && !item.expired ? <span className="tag amber">待你确认</span> : null}
                       {item.relevance === 'other' ? <span className="tag">别人的事</span> : null}
@@ -433,7 +600,7 @@ export function PlanDialog({ open, courses, onClose, onApply }: Props) {
                       {item.location ? ` · ${item.location}` : ''}
                       {item.deadline ? ` · 截止 ${item.deadline}` : ''}
                       {' · '}
-                      {item.source}
+                      {[item.channel, item.source].filter(Boolean).join(' · ')}
                     </div>
                     <div className="small muted" style={{ marginTop: 2 }}>
                       {item.reason}
@@ -464,7 +631,7 @@ export function PlanDialog({ open, courses, onClose, onApply }: Props) {
                   : '没认出具体时间'}
                 {current.location ? ` · ${current.location}` : ''}
                 {' · '}
-                {current.source}
+                {[current.channel, current.source].filter(Boolean).join(' · ')}
               </div>
               <div className="notice" style={{ marginTop: 8 }}>{current.reason}</div>
               <div

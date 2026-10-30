@@ -224,7 +224,15 @@ export async function activateApp(config: BridgeConfig, app: 'wechat' | 'feishu'
  * 助手是自己电脑上跑的 Python 服务，只监听 127.0.0.1，数据不出本机。
  * 连不上会直接抛错，界面上给用户一句可操作的提示。
  */
-export async function fetchToday(config: BridgeConfig, days = config.days): Promise<NoticeMessage[]> {
+export interface TodayReport {
+  messages: NoticeMessage[]
+  /** 本机助手的抱怨：微信没读成、飞书没授权、剪贴板是空的，都会写在这里。 */
+  warnings: string[]
+  /** 本机助手认为的今天，取值失败时是空串。 */
+  date: string
+}
+
+export async function fetchTodayReport(config: BridgeConfig, days = config.days): Promise<TodayReport> {
   const span = clampDays(days)
   const response = await fetch(`http://127.0.0.1:${config.port}/today?days=${span}`, {
     headers: { Accept: 'application/json' },
@@ -232,16 +240,28 @@ export async function fetchToday(config: BridgeConfig, days = config.days): Prom
   })
   if (!response.ok) throw new Error(`本机助手返回 ${response.status}`)
 
-  const data = (await response.json()) as { messages?: NoticeMessage[] } | NoticeMessage[]
+  const data = (await response.json()) as
+    | { messages?: NoticeMessage[]; warnings?: string[]; date?: string }
+    | NoticeMessage[]
   const raw = Array.isArray(data) ? data : (data.messages ?? [])
-  return raw
-    .filter((item) => item && typeof item.text === 'string' && item.text.trim().length > 0)
-    .map((item) => ({
-      source: item.source ?? '本机助手',
-      sender: item.sender ?? '',
-      at: item.at ?? '',
-      // 老版本的后端不返回 date，留空让解析时按今天算。
-      date: item.date ?? '',
-      text: item.text.trim(),
-    }))
+  return {
+    messages: raw
+      .filter((item) => item && typeof item.text === 'string' && item.text.trim().length > 0)
+      .map((item) => ({
+        source: item.source ?? '本机助手',
+        sender: item.sender ?? '',
+        at: item.at ?? '',
+        // 老版本的后端不返回 date，留空让解析时按今天算。
+        date: item.date ?? '',
+        // 老版本的后端不分渠道，留空，界面上就不显示「微信 / 飞书」标签。
+        channel: item.channel ?? '',
+        text: item.text.trim(),
+      })),
+    warnings: Array.isArray(data) ? [] : (data.warnings ?? []),
+    date: Array.isArray(data) ? '' : (data.date ?? ''),
+  }
+}
+
+export async function fetchToday(config: BridgeConfig, days = config.days): Promise<NoticeMessage[]> {
+  return (await fetchTodayReport(config, days)).messages
 }

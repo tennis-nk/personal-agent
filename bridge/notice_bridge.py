@@ -573,6 +573,9 @@ def collect(config: dict, days: int | None = None) -> dict:
 
     try:
         wechat, wx_warnings = read_wechat(config, today, days)
+        # 打渠道标记：前端要按「微信 / 飞书」分开显示，群名本身看不出来自哪个软件。
+        for message in wechat:
+            message["channel"] = "微信"
         messages.extend(wechat)
         warnings.extend(wx_warnings)
     except Exception:  # noqa: BLE001
@@ -581,6 +584,8 @@ def collect(config: dict, days: int | None = None) -> dict:
 
     try:
         feishu, fs_warnings = read_feishu(config, days)
+        for message in feishu:
+            message["channel"] = "飞书"
         messages.extend(feishu)
         warnings.extend(fs_warnings)
     except Exception:  # noqa: BLE001

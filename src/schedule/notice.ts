@@ -32,12 +32,20 @@ export interface NoticeMessage {
    * 不然前天的通知会被算成明天的日程。空字符串表示按今天算。
    */
   date?: string
+  /**
+   * 这条消息来自哪个软件：「微信」「飞书」。
+   * 手动粘贴的没有渠道，留空，界面上就只显示群名。
+   */
+  channel?: string
   text: string
 }
 
 export interface NoticeItem {
   id: string
+  /** 群名 / 会话名，例如「2026级自动化1班群」。 */
   source: string
+  /** 来自哪个软件：「微信」「飞书」，手动粘贴的为空。 */
+  channel: string
   sender: string
   raw: string
   /** 事项名，取第一句。 */
@@ -473,6 +481,7 @@ export function parseNotices(
       return {
         id: `notice-${index}-${message.source}-${message.at}`.replace(/\s/g, ''),
         source: message.source,
+        channel: message.channel ?? '',
         sender: message.sender,
         raw,
         title: extractTitle(raw),
