@@ -465,6 +465,115 @@ def list_wechat_sessions() -> tuple[list[str], str]:
     return unique, ""
 
 
+def _fold(text: str) -> str:
+    """把文本压成比对用的 key：换行和连续空格在控件名与时分 {消息对象} 里不一致。"""
+    return re.sub(r"\s+", "", text or "")
+
+
+# 纯文本气泡。图片/文件/动画表情是另一批类名，长通知只会出现在这种身上。
+_TEXT_ITEM_CLASSES = ("ChatTextItemView",)
+
+
+def _chat_board(wx):
+    """当前聊天对象的消息面板控件。"""
+    box = getattr(wx, "ChatBox", None)
+    return getattr(box, "msgbox", None) if box is not None else None
+
+
+def _board_snapshot(board, wx) -> tuple[list[tuple[str, str]], dict[str, str]]:
+    """读一屏消息：[(类名, 正文) 按界面顺序]，外加 {正文 key -> 发言人}。
+
+    正文直接从控件的显示文本上取——超长通知整屏只渲染它一个的时候，
+    控件上仍然带着全文，能拿到。
+
+    发言人只能回头找 wxauto4 要：昵称藏在气泡的子控件里，列表一虚拟化就回收了，
+    控件上一问三不知。所以这里是「两路结果按正文对表」，对不上的留空，
+    由 _pick_entries 决定要不要。
+    """
+    try:
+        stream = [((item.Name or "").strip(), _class_of(item)) for item in board.GetChildren()]
+    except Exception as error:  # noqa: BLE001
+        log(f"读消息面板失败：{error}")
+        return [], {}
+
+    senders: dict[str, str] = {}
+    for message in wx.GetAllMessage() or []:
+        sender, text = message_fields(message)
+        sender = (sender or "").strip()
+        text = (text or "").strip()
+        if not sender or not text:
+            continue
+        senders.setdefault(_fold(text), sender)
+    return [pair for pair in stream if pair[0]], senders
+
+
+def _class_of(item) -> str:
+    try:
+        return str(getattr(item, "ClassName", "") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _read_chat_stream(wx, rounds: int, pause: float) -> list[tuple[str, str]]:
+    """把一个聊天窗口的消息从头到尾捋一遍，给回 [(发言人, 正文)]。
+
+    微信 4.x 的聊天区是虚拟列表：只有屏幕里那几条真的存在。光靠 wxauto4 一次读取，
+    拿到的就是当前这一屏；作业通知那种一屏放不下的长消息更麻烦——它整屏只渲染一个，
+    而 wxauto4 不认这种形态，会连着整屏一起返回 0 条。
+
+    所以这里自己贴着列表慢慢往上滚，一屏一屏存下来再按位置拼成完整消息流，
+    缺失的发言人另找 wxauto4 对表补上。
+    """
+    board = _chat_board(wx)
+    if board is None:
+        return [message_fields(message) for message in wx.GetAllMessage() or []]
+
+    # 先贴到底，保证第一屏就是最新的消息。
+    for _ in range(3):
+        try:
+            board.WheelDown(wheelTimes=3, waitTime=0.03)
+        except Exception:  # noqa: BLE001
+            break
+    time.sleep(pause)
+
+    frames: list[list[tuple[str, str]]] = []
+    senders: dict[str, str] = {}
+    for _ in range(max(1, rounds)):
+        stream, mapping = _board_snapshot(board, wx)
+        senders.update(mapping)
+        if stream and (not frames or frames[-1] != stream):
+            frames.append(stream)
+        try:
+            board.WheelUp(wheelTimes=2, waitTime=0.03)
+        except Exception:  # noqa: BLE001
+            break
+        time.sleep(pause)
+
+    if not frames:
+        return [message_fields(message) for message in wx.GetAllMessage() or []]
+
+    # frames[0] 最靠下（最新），最后一屏最旧；倒着拼回来就是完整的消息顺序。
+    ordered: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for frame in reversed(frames):
+        for text, kind in frame:
+            key = _fold(text)
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append((text, kind))
+
+    entries: list[tuple[str, str]] = []
+    for text, kind in ordered:
+        sender = senders.get(_fold(text), "")
+        if not sender and not any(name in kind for name in _TEXT_ITEM_CLASSES):
+            # 读不出发言人的图片、文件、表情，多半是群里的闲聊，丢掉不心疼；
+            # 纯文本的通知（作业、截止日期）才值得冒这个险。
+            continue
+        entries.append((sender, text))
+    return entries
+
+
 def read_wechat(config: dict, today: date, days: int = 1) -> tuple[list[dict], list[str]]:
     section = config.get("wechat", {})
     warnings: list[str] = []
@@ -484,13 +593,15 @@ def read_wechat(config: dict, today: date, days: int = 1) -> tuple[list[dict], l
     wanted_map = {name: senders for name, senders in entries}
 
     days = max(1, min(7, int(days or 1)))
-    # 要往回看好几天，就得比「只看今天」多取一些消息；上限兜住，别把整个聊天记录读进来。
-    limit = min(max(int(section.get("max_messages", 60)), 30) * days, 400)
+    # 聊天区是虚拟列表，一屏只有几条；往上多滚几屏才看得到更早的通知。
+    rounds = max(1, min(8, int(section.get("scroll_rounds", 5) or 5)))
+    pause = 0.5
 
     def job() -> tuple[list[dict], list[str]]:
         wx = wx_instance()
         found: list[dict] = []
         notes: list[str] = []
+        unnamed = 0
         for name in sessions:
             try:
                 wx.ChatWith(name, exact=False)
@@ -498,15 +609,27 @@ def read_wechat(config: dict, today: date, days: int = 1) -> tuple[list[dict], l
                 notes.append(f"打开会话「{name}」失败：{error}")
                 continue
             time.sleep(0.6)
+            wanted = wanted_map.get(name) or []
             try:
-                raw = wx.GetAllMessage() or []
+                messages, missed = _pick_entries(
+                    name,
+                    _read_chat_stream(wx, rounds, pause),
+                    today,
+                    days,
+                    wanted,
+                )
             except Exception as error:  # noqa: BLE001
                 notes.append(f"读取「{name}」失败：{error}")
                 continue
-            wanted = wanted_map.get(name) or []
-            found.extend(_pick_window(name, raw[-limit:], today, days, wanted))
+            unnamed += missed
+            found.extend(messages)
             if wanted:
                 notes.append(f"「{name}」只看 {'、'.join(wanted)} 发的话")
+        if unnamed:
+            notes.append(
+                f"有 {unnamed} 条消息认不出发言人（列表虚拟化把昵称回收了），"
+                "已按群里成员不明放行，请自己在预览里挑一下"
+            )
         return found, notes
 
     # wxauto4 抓的是界面控件：窗口缩在任务栏时它一直空等到超时，
@@ -517,7 +640,9 @@ def read_wechat(config: dict, today: date, days: int = 1) -> tuple[list[dict], l
         return [], warnings
 
     try:
-        return wx_call(job, timeout=_wx_timeout(len(sessions)))
+        found, notes = wx_call(job, timeout=_wx_timeout(len(sessions), rounds))
+        warnings.extend(notes)
+        return found, warnings
     except WxMissing as error:
         warnings.append(f"微信没读成：{error}")
         return [], warnings
@@ -530,13 +655,14 @@ def read_wechat(config: dict, today: date, days: int = 1) -> tuple[list[dict], l
             hide_wechat()
 
 
-def _wx_timeout(sessions: int) -> float:
+def _wx_timeout(sessions: int, rounds: int = 5) -> float:
     """读一批会话给多久。
 
-    一个会话连切换带抓消息大约十几秒；固定 40 秒在读一周 × 十个群时必然超时，
-    看着像微信坏了。按会话数放宽，上限兜住别把 HTTP 请求挂太久。
+    一个会话连切换带滚几屏大约十几秒；固定 40 秒在读一周 × 十个群时必然超时，
+    看着像微信坏了。按会话数和滚动轮数放宽，上限兜住别把 HTTP 请求挂太久。
     """
-    return float(min(max(40, 15 * max(1, sessions)), 150))
+    per_chat = 6.0 + 1.2 * max(1, rounds)
+    return float(min(max(60, per_chat * max(1, sessions)), 300))
 
 
 def _pick_window(
@@ -546,6 +672,20 @@ def _pick_window(
     days: int = 1,
     wanted: list[str] | None = None,
 ) -> list[dict]:
+    """wxauto4 消息对象列表版，见 _pick_entries。"""
+    messages, _ = _pick_entries(
+        source, [message_fields(message) for message in raw], today, days, wanted
+    )
+    return messages
+
+
+def _pick_entries(
+    source: str,
+    entries: list[tuple[str, str]],
+    today: date,
+    days: int = 1,
+    wanted: list[str] | None = None,
+) -> tuple[list[dict], int]:
     """从一个会话的消息流里挑出最近 days 天的。
 
     消息流里没有绝对日期，靠日期分割条（今天 / 昨天 / 10月29日）判断归属：
@@ -559,10 +699,14 @@ def _pick_window(
     days = max(1, min(7, int(days or 1)))
     cutoff = today - timedelta(days=days - 1)
     messages: list[dict] = []
+    # leading 记录「还没见到任何分割条就先记下来的那几条」，末尾跟着第一条分割条改日期。
+    leading: list[dict] = []
+    first_divider: date | None = None
     context: date | None = None
 
-    for message in raw:
-        sender, text = message_fields(message)
+    for sender, text in entries:
+        sender = (sender or "").strip()
+        text = (text or "").strip()
         if not text:
             continue
         # 分割条先认，不管 sender 是什么：4.x 把它挂在 system 名下，
@@ -574,28 +718,43 @@ def _pick_window(
             guessed = today
         if guessed is not None:
             context = guessed
+            if first_divider is None and guessed < today:
+                # 头几条消息之前没有分割条，先按今天记了；这里看到第一条是更早的一天，
+                # 那就跟着它改回去，别把旧通知顶到今天。
+                first_divider = guessed
+                for message in leading:
+                    message["date"] = guessed.isoformat()
+                leading = []
             continue
         if is_system_noise(sender, text):
             continue
-        if context is None:
-            # 一条分割条都没见到，就当是今天的，回头由用户自己在预览里删。
-            context = today
-        if context < cutoff or context > today:
-            continue
         # 指定了人，就只留这个人发的。没指定（wanted 为空）就整群都要。
-        if not sender_hit(sender, wanted or []):
+        # 发言人缺失时放行：那是列表虚拟化把昵称回收了，读不出人名但内容多半是正经通知，
+        # 宁可让用户自己在预览里删，也别把作业截止日整条丢了。
+        if wanted and sender and not sender_hit(sender, wanted):
             continue
-        match = TIME_PATTERN.search(text)
+        # dates 超出窗口的先留着，末尾统一筛——前面还可能被第一条分割条改到窗口里来。
+        # 长通知里数字到处都是（几十道题号、几个截止时间），从中随手抓一个当时间
+        # 比不标时间更害人——宁可空着，让模型自己去看全文。
+        match = TIME_PATTERN.search(text) if len(text) <= 120 else None
         messages.append(
             {
                 "source": source,
-                "sender": sender or "未署名",
+                "sender": sender or "发言人未知",
                 "at": match.group(0) if match else "",
-                "date": context.isoformat(),
+                "date": context.isoformat() if context else today.isoformat(),
                 "text": text,
             }
         )
-    return messages
+        if context is None:
+            leading.append(messages[-1])
+
+    floor = cutoff.isoformat()
+    ceiling = today.isoformat()
+    kept = [message for message in messages if floor <= message["date"] <= ceiling]
+    # 认不出发言人的条数：列表虚拟化把昵称回收了，只在末尾统计一下告诉用户。
+    unnamed = sum(1 for message in kept if message["sender"] == "发言人未知")
+    return kept, unnamed
 
 
 # --------------------------------------------------------------------------- #

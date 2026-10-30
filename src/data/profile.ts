@@ -19,7 +19,7 @@ export interface BridgeConfig {
   days: number
 }
 
-export const DEFAULT_BRIDGE: BridgeConfig = { enabled: false, port: 8787, days: 1 }
+export const DEFAULT_BRIDGE: BridgeConfig = { enabled: false, port: 8787, days: 2 }
 
 /** 收集范围只在 1~7 天之间，超出就夹回来。 */
 export function clampDays(value: number): number {
