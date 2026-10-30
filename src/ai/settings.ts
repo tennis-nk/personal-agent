@@ -66,30 +66,7 @@ export const PRESETS: Preset[] = [
     hint: '需要能访问 OpenAI 的网络',
   },
   { id: 'custom', name: '自定义', baseUrl: '', model: '', hint: '任意 OpenAI 兼容接口' },
-  {
-    // 本机跑的模型（Ollama / LM Studio / vLLM 都提供 OpenAI 兼容接口）。
-    // 单独给两组是因为从 file:// 打开的页面请求 127.0.0.1 会带 Origin: null，
-    // Ollama 默认只放行 localhost 来源，会直接 403。要么设 OLLAMA_ORIGINS=*，
-    // 要么走本机助手转发（下面第二项），后者不用改任何环境变量。
-    id: 'local',
-    name: '本地模型 · 直连',
-    baseUrl: 'http://127.0.0.1:11434/v1',
-    model: 'deepseek-r1:7b',
-    hint: 'Ollama 默认端口 11434。启动 Ollama 前先设 OLLAMA_ORIGINS=*，否则网页直连会被跨域拦住',
-  },
-  {
-    id: 'local-bridge',
-    name: '本地模型 · 经本机助手',
-    baseUrl: 'http://127.0.0.1:8787/llm',
-    model: 'deepseek-r1:7b',
-    hint: '由 bridge/notice_bridge.py 转发到本机模型，不用改环境变量；需要 bridge 在跑',
-  },
 ]
-
-/** 这两项是本机模型：不要求填 Key，可以提供「读取本机模型」按钮。 */
-export function isLocalProvider(id: string): boolean {
-  return id === 'local' || id === 'local-bridge'
-}
 
 /**
  * 识图模型预设。
@@ -134,34 +111,18 @@ export const VISION_PRESETS: Preset[] = [
     model: 'gpt-4o-mini',
     hint: '需要能访问 OpenAI 的网络',
   },
-  {
-    // 本地视觉模型。Ollama 的 /v1/chat/completions 支持 base64 图片（官方兼容性文档列了图像 content），
-    // 所以本地也能识图，只是得换一个带视觉的模型——deepseek-r1 这类纯文本蒸馏模型没有视觉塔。
-    id: 'local-vision',
-    name: '本地 qwen2.5vl:7b · 直连',
-    baseUrl: 'http://127.0.0.1:11434/v1',
-    model: 'qwen2.5vl:7b',
-    hint: '先 ollama pull qwen2.5vl:7b；直连要先设 OLLAMA_ORIGINS=*。中文表格能读，但密集课表容易错列',
-  },
-  {
-    id: 'local-vision-bridge',
-    name: '本地 qwen2.5vl:7b · 经本机助手',
-    baseUrl: 'http://127.0.0.1:8787/llm',
-    model: 'qwen2.5vl:7b',
-    hint: '不用改环境变量；bridge 的上游要指向 11434（文本和识图共用同一个上游）',
-  },
 ]
 
 /**
  * 识图实际会打到哪个接口、哪个模型。
  *
  * resolveVision() 已经把「留空就同上」算进去了，这里再给一层判断，
- * 好在界面上说清楚「现在到底谁在读图」——本地文本模型被继承去识图是最常见的坑。
+ * 好在界面上说清楚「现在到底谁在读图」——文本模型被继承去识图是最常见的坑，
+ * 而 DeepSeek 的文本模型并不收图片。
  */
 export function visionTarget(settings: LlmSettings): {
   baseUrl: string
   model: string
-  local: boolean
   /** 没单独填，直接沿用了文本模型。 */
   inherited: boolean
 } {
@@ -169,7 +130,6 @@ export function visionTarget(settings: LlmSettings): {
   return {
     baseUrl: resolved.baseUrl,
     model: resolved.model,
-    local: isLocalEndpoint(resolved.baseUrl),
     inherited: !settings.visionModel.trim() && !settings.visionBaseUrl.trim(),
   }
 }
@@ -198,8 +158,14 @@ export function loadSettings(): LlmSettings {
     const raw = window.localStorage.getItem(SETTINGS_KEY)
     if (!raw) return { ...DEFAULT_SETTINGS }
     const parsed = JSON.parse(raw) as Partial<LlmSettings>
+    // 老版本存过 'local' / 'local-bridge' 这类已下线的服务商，落到下拉框里会是个空白项。
+    // 认不出来就退回自定义，地址和模型名还留着，用户自己改成有效的一家即可。
+    const provider =
+      typeof parsed.provider === 'string' && PRESETS.some((item) => item.id === parsed.provider)
+        ? parsed.provider
+        : 'custom'
     return {
-      provider: typeof parsed.provider === 'string' ? parsed.provider : DEFAULT_SETTINGS.provider,
+      provider,
       baseUrl: typeof parsed.baseUrl === 'string' ? parsed.baseUrl : DEFAULT_SETTINGS.baseUrl,
       apiKey: typeof parsed.apiKey === 'string' ? parsed.apiKey : '',
       model: typeof parsed.model === 'string' ? parsed.model : DEFAULT_SETTINGS.model,
@@ -256,23 +222,13 @@ export function storageWritable(): boolean {
   }
 }
 
-/** 只有这三样齐全才认为接入了模型，否则一律走本地规则引擎。 */
-/** 指向本机的地址不用 Key：Ollama / LM Studio / vLLM 默认都不校验。 */
-export function isLocalEndpoint(baseUrl: string): boolean {
-  const raw = baseUrl.trim()
-  if (!raw) return false
-  try {
-    const url = new URL(/^[a-z]+:\/\//i.test(raw) ? raw : `http://${raw}`)
-    return ['127.0.0.1', 'localhost', '::1', '[::1]', '0.0.0.0'].includes(url.hostname)
-  } catch {
-    return false
-  }
-}
-
+/** 地址、模型名、Key 三样齐全才认为接入了模型，否则一律走本地规则引擎。 */
 export function isReady(settings: LlmSettings): boolean {
-  if (!settings.baseUrl.trim() || !settings.model.trim()) return false
-  // 云端服务商必须具备 Key；本机模型留空也能用，否则本地部署会被一刀切判成「离线模式」。
-  return settings.apiKey.trim().length > 0 || isLocalEndpoint(settings.baseUrl)
+  return (
+    settings.baseUrl.trim().length > 0 &&
+    settings.model.trim().length > 0 &&
+    settings.apiKey.trim().length > 0
+  )
 }
 
 /** 把用户填的地址补成完整的 chat completions 端点，容忍末尾斜杠和多余路径。 */

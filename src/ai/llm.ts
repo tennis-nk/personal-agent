@@ -33,7 +33,7 @@ export interface LlmStreamOptions {
 export async function streamChat(settings: LlmSettings, options: LlmStreamOptions): Promise<string> {
   const endpoint = resolveEndpoint(settings.baseUrl)
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  // 本机模型通常不校验 Key，别塞一个空的 Bearer 进去（个别服务会因此报 401）。
+  // 没填 Key 就别塞一个空的 Bearer 进去，个别网关会因此报 401 而不是「缺鉴权」。
   if (settings.apiKey.trim()) headers.Authorization = `Bearer ${settings.apiKey.trim()}`
 
   const body: Record<string, unknown> = {
@@ -250,36 +250,4 @@ export async function testConnection(settings: LlmSettings): Promise<string> {
     temperature: 0,
   })
   return `${model} 可用，回复：${text.trim().slice(0, 40) || '（空回复）'}`
-}
-
-/**
- * 问一下这个接口上有哪些模型。
- *
- * 只对本机模型有意义：Ollama 里 pull 过的模型名字带 tag（deepseek-r1:7b），
- * 手打容易错一个字符就报「model not found」。云端服务商的 /models 经常不开放，也犯不上探。
- */
-export async function listModels(baseUrl: string, apiKey: string): Promise<string[]> {
-  const root = baseUrl.trim().replace(/\/+$/, '').replace(/\/chat\/completions$/, '')
-  const response = await fetch(`${root}/models`, {
-    headers: apiKey.trim() ? { Authorization: `Bearer ${apiKey.trim()}` } : {},
-  })
-  if (!response.ok) throw new LlmError(`接口返回 ${response.status}`, 'network_failed')
-  // 三种形状都要认：
-  //   OpenAI 兼容 → {data:[{id}]}
-  //   Ollama 原生 → {models:[{name}]}
-  //   本机助手转发 → {models:["名字", ...]}（直接是字符串数组，别按对象取 .name）
-  const payload = (await response.json()) as { data?: unknown[]; models?: unknown[] }
-  const names: string[] = []
-  for (const item of [...(payload.data ?? []), ...(payload.models ?? [])]) {
-    if (typeof item === 'string') {
-      names.push(item)
-      continue
-    }
-    if (item && typeof item === 'object') {
-      const record = item as { id?: string; name?: string; model?: string }
-      const name = record.id ?? record.name ?? record.model
-      if (name) names.push(name)
-    }
-  }
-  return Array.from(new Set(names.filter(Boolean))).sort((a, b) => a.localeCompare(b))
 }

@@ -34,11 +34,6 @@ from urllib.parse import parse_qs, urlparse
 import urllib.error
 import urllib.request
 
-# 本机模型走的是 127.0.0.1，必须绕过系统代理。
-# 装了 Clash / 公司代理的机器上，HTTP_PROXY 会让 urllib 把 localhost 请求也发给代理，
-# 结果就是「upstream connect failed」——明明服务在跑。
-_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
 HERE = Path(__file__).resolve().parent
 
 # 飞书 SDK 是可选依赖：没装 SDK 或没配置授权时自动退回剪贴板模式，不该让整个服务起不来。
@@ -74,15 +69,6 @@ DEFAULT_CONFIG = {
         "window": "飞书",
         # 飞书读不到窗口文本，clipboard 模式改读剪贴板。
         "use_clipboard": True,
-    },
-    # 给本地模型做反向代理。
-    # 从 file:// 打开的页面请求 127.0.0.1 会带 Origin: null，Ollama 默认只放行 localhost，
-    # 会 403；经这里转发就没有跨域这回事，也不用去改 OLLAMA_ORIGINS。
-    # 前端把接口地址填成 http://127.0.0.1:8787/llm 即可。
-    "llm": {
-        "upstream": "http://127.0.0.1:11434/v1",
-        "api_key": "",
-        "timeout": 180,
     },
 }
 
@@ -627,121 +613,6 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    # ------------------------------ 本地模型转发 ------------------------------
-
-    def _llm_section(self) -> dict:
-        section = self.config.get("llm") or {}
-        upstream = str(section.get("upstream") or "http://127.0.0.1:11434/v1").rstrip("/")
-        return {
-            "upstream": upstream,
-            "api_key": str(section.get("api_key") or ""),
-            "timeout": int(section.get("timeout") or 180),
-        }
-
-    def _llm_headers(self) -> dict:
-        """转发用的请求头。前端传的 Key 优先，config 里的兜底。"""
-        headers = {"Content-Type": "application/json"}
-        incoming = self.headers.get("Authorization")
-        section = self._llm_section()
-        if incoming:
-            headers["Authorization"] = incoming
-        elif section["api_key"]:
-            headers["Authorization"] = f"Bearer {section['api_key']}"
-        return headers
-
-    def _forward_models(self) -> None:
-        """把本机模型的 /models 透出去，省得用户手打模型名。"""
-        section = self._llm_section()
-        request = urllib.request.Request(f"{section['upstream']}/models", headers=self._llm_headers(), method="GET")
-        try:
-            with _LOCAL_OPENER.open(request, timeout=15) as response:
-                body = response.read()
-        except urllib.error.HTTPError as error:
-            self._send(200, {"ok": False, "error": f"上游返回 {error.code}", "models": []})
-            return
-        except (urllib.error.URLError, OSError) as error:
-            log(f"读模型列表失败：{error}")
-            self._send(
-                200,
-                {
-                    "ok": False,
-                    "models": [],
-                    "error": f"连不上 {section['upstream']}：{error}",
-                },
-            )
-            return
-        try:
-            payload = json.loads(body.decode("utf-8") or "{}")
-        except ValueError:
-            self._send(200, {"ok": False, "models": [], "error": "上游返回的不是 JSON"})
-            return
-        models = [item.get("id") for item in payload.get("data") or [] if item.get("id")]
-        self._send(200, {"ok": True, "models": models, "upstream": section["upstream"]})
-
-    def _forward_chat(self) -> None:
-        """把 /chat/completions 转给本机模型，流式边收边转。
-
-        不缓冲整个响应：一次分类要吐几千字，攒完再发会让界面一直空着。
-        """
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            body = self.rfile.read(length)
-        except (ValueError, OSError):
-            self._send(400, {"error": "读不到请求体"})
-            return
-
-        section = self._llm_section()
-        request = urllib.request.Request(
-            f"{section['upstream']}/chat/completions",
-            data=body,
-            headers=self._llm_headers(),
-            method="POST",
-        )
-        try:
-            upstream = _LOCAL_OPENER.open(request, timeout=section["timeout"])
-        except urllib.error.HTTPError as error:
-            # 上游的 4xx/5xx 原样传回去，前端才能按状态码给出「模型不支持图片」这类提示。
-            raw = error.read()
-            self.send_response(error.code)
-            self.send_header("Content-Type", error.headers.get("Content-Type", "application/json"))
-            self.send_header("Content-Length", str(len(raw)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(raw)
-            return
-        except (urllib.error.URLError, OSError) as error:
-            self._send(
-                502,
-                {
-                    "error": {
-                        "message": f"连不上本机模型 {section['upstream']}：{error}。"
-                        "确认 Ollama / LM Studio 已启动，或改设置里的上游地址。"
-                    }
-                },
-            )
-            return
-
-        self.send_response(200)
-        self.send_header("Content-Type", upstream.headers.get("Content-Type", "text/event-stream"))
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        # 没有 Content-Length，只能靠关连接表示结束
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.close_connection = True
-        try:
-            while True:
-                chunk = upstream.read(2048)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            # 用户在中途点了停止，正常现象
-            pass
-        finally:
-            upstream.close()
-
     def do_GET(self) -> None:  # noqa: N802
         route = urlparse(self.path)
         query = parse_qs(route.query)
@@ -800,10 +671,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"config": self.config})
             return
 
-        if route.path == "/llm/models":
-            self._forward_models()
-            return
-
         if route.path == "/today":
             # ?days=N 让前端临时改收集范围，不改 config 也能取最近一周。
             raw_days = (query.get("days") or [""])[0].strip()
@@ -827,10 +694,6 @@ class Handler(BaseHTTPRequestHandler):
             state = feishu_sdk.login_async()
             log("飞书授权已发起，等用户在飞书确认")
             self._send(200, {"ok": True, **state})
-            return
-
-        if route.path == "/llm/chat/completions":
-            self._forward_chat()
             return
 
         if route.path == "/quit":
@@ -857,15 +720,6 @@ class Handler(BaseHTTPRequestHandler):
         config = json.loads(json.dumps(self.config))
         if isinstance(patch.get("port"), int) and 1024 < patch["port"] < 65535:
             config["port"] = patch["port"]
-        llm_incoming = patch.get("llm")
-        if isinstance(llm_incoming, dict):
-            config.setdefault("llm", {})
-            if isinstance(llm_incoming.get("upstream"), str) and llm_incoming["upstream"].strip():
-                config["llm"]["upstream"] = llm_incoming["upstream"].strip()
-            if isinstance(llm_incoming.get("api_key"), str):
-                config["llm"]["api_key"] = llm_incoming["api_key"].strip()
-            if isinstance(llm_incoming.get("timeout"), int):
-                config["llm"]["timeout"] = max(10, min(600, llm_incoming["timeout"]))
 
         for section in ("wechat", "feishu"):
             incoming = patch.get(section)

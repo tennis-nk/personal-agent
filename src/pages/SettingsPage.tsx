@@ -1,11 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import { isModelReady } from '../ai/agent'
-import { describeLlmError, listModels, testConnection } from '../ai/llm'
+import { describeLlmError, testConnection } from '../ai/llm'
 import {
   PRESETS,
   VISION_PRESETS,
   DEFAULT_SETTINGS,
-  isLocalProvider,
   isReady,
   visionTarget,
   notifyLlmChanged,
@@ -45,10 +44,6 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
   const [settings, setSettings] = useState<LlmSettings>(() => loadSettings())
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState('')
-  /** 从本机模型接口探到的模型名，选填用。 */
-  const [localModels, setLocalModels] = useState<string[]>([])
-  const [listingModels, setListingModels] = useState(false)
-  const [modelNote, setModelNote] = useState('')
   /** 上一次改动有没有写进浏览器；null 表示这次还没动过。 */
   const [saveState, setSaveState] = useState<{ ok: boolean; at: Date } | null>(null)
   const [dataMessage, setDataMessage] = useState('')
@@ -388,30 +383,6 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
     })
   }
 
-  /** 问一下本机模型服务上有哪些模型，省得手打 tag 打错。 */
-  async function handleListModels(): Promise<void> {
-    setListingModels(true)
-    setModelNote('')
-    try {
-      const models = await listModels(settings.baseUrl, settings.apiKey)
-      setLocalModels(models)
-      setModelNote(
-        models.length > 0
-          ? `读到 ${models.length} 个模型，点名字直接填进模型名。`
-          : '接口连上了，但没列出模型。Ollama 要先 ollama pull 一个模型。',
-      )
-    } catch (error) {
-      setModelNote(
-        `读不到模型列表：${describeLlmError(error)}。` +
-          (settings.provider === 'local' || settings.provider === 'local-bridge'
-            ? ' 若用「直连」，先在启动 Ollama 前设 OLLAMA_ORIGINS=*；不想改环境变量就换成「经本机助手」。'
-            : ''),
-      )
-    } finally {
-      setListingModels(false)
-    }
-  }
-
   async function handleTest(): Promise<void> {
     setTesting(true)
     setTestResult('')
@@ -530,37 +501,12 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
             <input
               className="input"
               value={settings.model}
-              placeholder={isLocalProvider(settings.provider) ? 'deepseek-r1:7b' : 'deepseek-flash'}
+              placeholder="deepseek-flash"
               onChange={(event) => update({ model: event.target.value })}
             />
-            {isLocalProvider(settings.provider) ? (
-              <>
-                <div className="row wrap" style={{ gap: 8, marginTop: 6 }}>
-                  <button className="btn small" onClick={() => void handleListModels()} disabled={listingModels}>
-                    {listingModels ? '读取中…' : '读取本机模型'}
-                  </button>
-                  {localModels.length > 0 ? (
-                    <select
-                      className="select"
-                      style={{ flex: 1, minWidth: 160 }}
-                      value={localModels.includes(settings.model) ? settings.model : ''}
-                      onChange={(event) => update({ model: event.target.value })}
-                    >
-                      <option value="">从列表里挑一个…</option>
-                      {localModels.map((name) => (
-                        <option key={name} value={name}>
-                          {name}
-                        </option>
-                      ))}
-                    </select>
-                  ) : null}
-                </div>
-                {modelNote ? <div className="small muted">{modelNote}</div> : null}
-                <div className="small muted">
-                  本机模型不用填 API Key。名字要和 Ollama 里的完全一致（带 :7b 这种 tag）。
-                </div>
-              </>
-            ) : null}
+            <div className="small muted">
+              DeepSeek 的文本模型是 deepseek-flash，识图也是同一个型号，所以下面一栏留空即可。
+            </div>
           </div>
 
           <div className="field">
@@ -579,29 +525,12 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
                 onChange={(event) => update({ visionBaseUrl: event.target.value })}
               />
             </div>
-            <div className={`small ${vision.inherited && vision.local ? '' : 'muted'}`}>
-              {(() => {
-                const where = vision.local ? '本机' : '云端'
-                if (vision.inherited && vision.local) {
-                  return (
-                    <span style={{ color: 'var(--red)' }}>
-                      现在识图会跟着文本走 → {vision.model}（{where}）。本地文本模型基本没有视觉能力，
-                      识图会报 400 或瞎编，建议下面单独挑一个带视觉的。
-                    </span>
-                  )
-                }
-                return `识图现在用：${vision.model}（${where}）${
-                  vision.inherited ? '，和文本模型同一家' : '，和文本模型分开配置'
-                }。`
-              })()}
-            </div>
-            {!vision.inherited && !vision.local ? (
-              <div className="small muted">
-                文本走本机、识图走云端是推荐组合：本地模型省钱，读图交给准的那个。
-              </div>
-            ) : null}
             <div className="small muted">
-              纯文本模型不收图片。本地要识图得换成带视觉的型号（qwen2.5vl、minicpm-v、gemma3 之类）。
+              {`识图现在用：${vision.model}${vision.inherited ? '（和文本模型同一家）' : '（单独配置）'}。`}
+            </div>
+            <div className="small muted">
+              纯文本模型不收图片。要识图就得填带视觉的型号：DeepSeek 是 <code>deepseek-flash</code>，
+              下面几个按钮可以直接切。
             </div>
             <div className="row wrap" style={{ marginTop: 8 }}>
               {VISION_PRESETS.map((preset) => (
