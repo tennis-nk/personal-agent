@@ -7,7 +7,7 @@
  * 在人眼下一秒就能发现，落进日历后要查一学期。
  */
 
-import { visionChat } from '../ai/llm'
+import { LlmError, visionChat } from '../ai/llm'
 import { isReady, loadSettings, resolveVision, type LlmSettings } from '../ai/settings'
 import { parseTimetable } from './parse'
 
@@ -201,14 +201,22 @@ export async function recognizeTimetable(
     throw new Error('还没配好模型。到设置页填上 API Key，识图模型填一个带视觉的型号（如 deepseek-flash）。')
   }
 
-  const raw = await visionChat(vision, {
-    prompt: TIMETABLE_PROMPT,
-    images: [dataUrl],
-    temperature: 0,
-    // 一份课表能到十几门课、每门一行六字段，2048 有时候正好被截断，
-    // 截断后 content 是空的，看起来就像「模型什么都没读出来」。
-    maxTokens: 4096,
-  })
+  // 一份课表能到十几门课、每门一行六字段，预算给小了会被截断；而推理模型
+  // 把预算花在思考上时 content 直接是空的，看起来就像「模型什么都没读出来」。
+  // 所以先给 4096，被截断了再翻倍重试一次，别让用户自己猜。
+  const ask = (maxTokens: number) =>
+    visionChat(vision, { prompt: TIMETABLE_PROMPT, images: [dataUrl], temperature: 0, maxTokens })
+
+  let raw: string
+  try {
+    raw = await ask(4096)
+  } catch (error) {
+    if (error instanceof LlmError && error.code === 'truncated') {
+      raw = await ask(8192)
+    } else {
+      throw error
+    }
+  }
 
   if (/NOT_TIMETABLE/.test(raw)) {
     return {
@@ -219,7 +227,7 @@ export async function recognizeTimetable(
     }
   }
 
-  // 空返回要单独说：多半是 max_tokens 被截断，或者这个模型压根不收图片。
+  // 空返回理论上已经在 visionChat 里拦掉了，这里兜一下自定义网关不按套路返回的情况。
   if (!raw.trim()) {
     throw new Error(
       '模型返回了空内容。常见原因是当前识图模型不收图片，或者输出被长度限制截断了。' +

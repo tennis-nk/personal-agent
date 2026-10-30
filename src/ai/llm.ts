@@ -204,15 +204,40 @@ export async function visionChat(settings: LlmSettings, options: VisionOptions):
   }
 
   const payload = (await response.json()) as {
-    choices?: { message?: { content?: string | { text?: string }[] } }[]
+    choices?: {
+      message?: { content?: string | { text?: string }[]; reasoning_content?: string }
+      finish_reason?: string
+    }[]
+    usage?: { completion_tokens?: number; completion_tokens_details?: { reasoning_tokens?: number } }
   }
-  const raw = payload.choices?.[0]?.message?.content
-  if (typeof raw === 'string') return raw
+  const choice = payload.choices?.[0]
+  const raw = choice?.message?.content
+  let text = ''
+  if (typeof raw === 'string') text = raw
   // 少数服务商把 content 拆成块返回，拼回来即可。
-  if (Array.isArray(raw)) {
-    return raw.map((part) => (typeof part === 'string' ? part : (part?.text ?? ''))).join('')
+  else if (Array.isArray(raw)) {
+    text = raw.map((part) => (typeof part === 'string' ? part : (part?.text ?? ''))).join('')
   }
-  throw new LlmError('模型返回里没有文字内容，换一个识图模型试试。', 'empty_stream')
+
+  if (text.trim()) return text
+
+  // 空内容要把「为什么空」查清楚：finish_reason=length 是输出被截断
+  // （推理模型把预算全花在思考上时 content 就是空的），其余多半是模型压根不看图。
+  const reason = choice?.finish_reason ?? 'unknown'
+  const used = payload.usage?.completion_tokens
+  const thought = choice?.message?.reasoning_content?.length ?? 0
+  const facts = [
+    `finish_reason=${reason}`,
+    used ? `输出 ${used} tokens` : '',
+    thought ? `其中思考内容 ${thought} 字` : '',
+  ]
+    .filter(Boolean)
+    .join('，')
+
+  if (reason === 'length') {
+    throw new LlmError(`模型输出被长度限制截断了（${facts}）`, 'truncated')
+  }
+  throw new LlmError(`模型返回了空内容（${facts}）`, 'empty_content')
 }
 
 /** 把各种失败翻译成用户看得懂的一句话，顺带给出下一步动作。 */
@@ -232,6 +257,10 @@ export function describeLlmError(error: unknown): string {
         return error.message
       case 'vision_unsupported':
         return `${error.message}｜多半是当前模型不收图片。DeepSeek 要填 deepseek-flash，其他服务商要填带视觉的型号（glm-4v-flash / qwen-vl-max / gpt-4o-mini），在设置页的「识图模型」里改。`
+      case 'truncated':
+        return `${error.message}｜换更短的图，或把设置页的识图模型换成不带推理的视觉型号。`
+      case 'empty_content':
+        return `${error.message}｜这个型号看到了图但没吐字：要么它不是视觉模型，要么图里字太小看不清。把「识图模型」改成 deepseek-flash，截图时只框课表那块（别整屏截）再试。`
       default:
         return error.message
     }
