@@ -8,15 +8,6 @@ export interface LlmSettings {
   model: string
   /** 是否给请求加上 response_format: json_object。部分服务商不支持，默认关。 */
   jsonMode: boolean
-  /** 识图用的模型名。留空则复用 model（很多服务商图文同一个模型）。 */
-  visionModel: string
-  /** 识图用的接口地址。换一家服务商识图时才需要填。 */
-  visionBaseUrl: string
-  /**
-   * 识图专用的 Key。留空就复用 apiKey。
-   * 文本用 DeepSeek、识图换智谱时，两家的 Key 不一样，共用一栏必然有一边 401。
-   */
-  visionApiKey: string
 }
 
 export interface Preset {
@@ -34,13 +25,6 @@ export const PRESETS: Preset[] = [
     baseUrl: 'https://api.deepseek.com/v1',
     model: 'deepseek-flash',
     hint: '便宜、中文好，文本和图片都支持，浏览器可直连',
-  },
-  {
-    id: 'zhipu',
-    name: '智谱 GLM',
-    baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
-    model: 'glm-4-flash',
-    hint: 'glm-4-flash 有免费额度',
   },
   {
     id: 'moonshot',
@@ -73,93 +57,12 @@ export const PRESETS: Preset[] = [
   { id: 'custom', name: '自定义', baseUrl: '', model: '', hint: '任意 OpenAI 兼容接口' },
 ]
 
-/**
- * 识图模型预设。
- *
- * 纯文本模型收不了图片，一到识图就会报 400。DeepSeek 的视觉模型叫 deepseek-flash
- * （旧的 deepseek-v4-flash-vision-exp 也能用），其余各家也都有带 -v / -vl 后缀的型号，
- * 这里单独列一份，省得用户去翻文档。
- */
-export const VISION_PRESETS: Preset[] = [
-  {
-    id: 'deepseek-flash',
-    name: 'DeepSeek V4 Flash（识图）',
-    baseUrl: 'https://api.deepseek.com/v1',
-    model: 'deepseek-flash',
-    hint: '官方视觉模型，和文本模型同一个 Key',
-  },
-  {
-    id: 'zhipu-vision',
-    name: '智谱 GLM-4V',
-    baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
-    model: 'glm-4v-flash',
-    hint:
-      '免费、不做长推理，适合读表格。两个限制要知道：接口不回跨域头，必须经本机助手转发；' +
-      '内容审核偏严，课表里有「思政」类课程名或学号姓名时可能整单被拒，那就换通义。若提示模型不存在，把型号改成 glm-4.6v-flash',
-  },
-  {
-    id: 'qwen-vl',
-    name: '通义千问 VL',
-    baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-    model: 'qwen-vl-max',
-    hint: '浏览器可直连，不用本机助手。新账号有免费 token 额度',
-  },
-  {
-    id: 'siliconflow-vl',
-    name: '硅基流动 Qwen2.5-VL',
-    baseUrl: 'https://api.siliconflow.cn/v1',
-    model: 'Qwen/Qwen2.5-VL-72B-Instruct',
-    hint: '开源视觉模型，按量计费',
-  },
-  {
-    id: 'openai-vision',
-    name: 'OpenAI gpt-4o-mini',
-    baseUrl: 'https://api.openai.com/v1',
-    model: 'gpt-4o-mini',
-    hint: '需要能访问 OpenAI 的网络',
-  },
-]
-
-/**
- * 识图实际会打到哪个接口、哪个模型。
- *
- * resolveVision() 已经把「留空就同上」算进去了，这里再给一层判断，
- * 好在界面上说清楚「现在到底谁在读图」——文本模型被继承去识图是最常见的坑，
- * 而 DeepSeek 的文本模型并不收图片。
- */
-export function visionTarget(settings: LlmSettings): {
-  baseUrl: string
-  model: string
-  /** 没单独填，直接沿用了文本模型。 */
-  inherited: boolean
-} {
-  const resolved = resolveVision(settings)
-  return {
-    baseUrl: resolved.baseUrl,
-    model: resolved.model,
-    inherited: !settings.visionModel.trim() && !settings.visionBaseUrl.trim(),
-  }
-}
-
 export const DEFAULT_SETTINGS: LlmSettings = {
   provider: 'deepseek',
   baseUrl: 'https://api.deepseek.com/v1',
   apiKey: '',
   model: 'deepseek-flash',
   jsonMode: false,
-  visionModel: '',
-  visionBaseUrl: '',
-  visionApiKey: '',
-}
-
-/** 识图时实际用的配置：没单独填就整套复用文本模型。 */
-export function resolveVision(settings: LlmSettings): LlmSettings {
-  return {
-    ...settings,
-    baseUrl: settings.visionBaseUrl.trim() || settings.baseUrl,
-    model: settings.visionModel.trim() || settings.model,
-    apiKey: settings.visionApiKey.trim() || settings.apiKey,
-  }
 }
 
 export function loadSettings(): LlmSettings {
@@ -179,9 +82,6 @@ export function loadSettings(): LlmSettings {
       apiKey: typeof parsed.apiKey === 'string' ? parsed.apiKey : '',
       model: typeof parsed.model === 'string' ? parsed.model : DEFAULT_SETTINGS.model,
       jsonMode: parsed.jsonMode === true,
-      visionModel: typeof parsed.visionModel === 'string' ? parsed.visionModel : '',
-      visionBaseUrl: typeof parsed.visionBaseUrl === 'string' ? parsed.visionBaseUrl : '',
-      visionApiKey: typeof parsed.visionApiKey === 'string' ? parsed.visionApiKey : '',
     }
   } catch {
     return { ...DEFAULT_SETTINGS }

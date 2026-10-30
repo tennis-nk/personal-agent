@@ -2,9 +2,6 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { defaultSemesterStart, parseSemesterHint, parseTimetable, parseWeeks, weekdayName } from '../schedule/parse'
 import { SLOT_PRESETS, loadSlots, saveSlots, slotRange, type Slot } from '../schedule/slots'
 import { weekIndexOf } from '../schedule/occurrence'
-import { fileToDataUrl, recognizeTimetable } from '../schedule/ocr'
-import { isReady, loadSettings, resolveVision } from '../ai/settings'
-import { describeLlmError } from '../ai/llm'
 import { daysBetween, shiftDays, today } from '../utils/date'
 
 const WEEKDAY_OPTIONS = [1, 2, 3, 4, 5, 6, 7]
@@ -88,16 +85,10 @@ export function ImportTimetableDialog({ open, busy = false, onCancel, onImport }
   const [showSlots, setShowSlots] = useState(false)
   /** 用户手动改过开学日之后，就不再用文本里的日期覆盖他的输入。 */
   const [semesterTouched, setSemesterTouched] = useState(false)
-  const [imageUrl, setImageUrl] = useState('')
-  const [ocrBusy, setOcrBusy] = useState(false)
-  const [ocrNote, setOcrNote] = useState<{ text: string; kind: 'ok' | 'error' } | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
-  const imageRef = useRef<HTMLInputElement>(null)
 
   const parsed = useMemo(() => parseTimetable(text, totalWeeks), [text, totalWeeks])
   const semesterHint = useMemo(() => parseSemesterHint(text), [text])
-  // 每次渲染都读一遍配置也花不了什么，省得缓存和开关状态打架。
-  const visionReady = isReady(resolveVision(loadSettings()))
 
   // 周次换算是「相对开学日」算的：开学日填成学期中间的日子，整份课表会平移好几周，
   // 表现出来就是导入成功但日历上一节课都没有。文本里写了日期就直接用它的。
@@ -120,7 +111,6 @@ export function ImportTimetableDialog({ open, busy = false, onCancel, onImport }
     if (!open) return
     setSlots(loadSlots())
     setSemesterTouched(false)
-    setOcrNote(null)
   }, [open])
 
   useEffect(() => {
@@ -161,29 +151,6 @@ export function ImportTimetableDialog({ open, busy = false, onCancel, onImport }
     setText(content)
   }
 
-  /** 图片交给视觉模型读，读出来先填进文本框，让用户自己核一遍再导入。 */
-  async function handleImage(file: File): Promise<void> {
-    setOcrBusy(true)
-    setOcrNote({ text: '正在识别，课表图一般几秒钟…', kind: 'ok' })
-    try {
-      const preview = URL.createObjectURL(file)
-      setImageUrl(preview)
-      const dataUrl = await fileToDataUrl(file)
-      const result = await recognizeTimetable(dataUrl)
-      // 读空了就别往文本框里塞空串，更别把上一次的内容当成这次的识别结果。
-      if (result.empty || !result.text.trim()) {
-        setOcrNote({ text: result.note, kind: 'error' })
-        return
-      }
-      setText((prev) => (prev.trim() ? `${prev.trim()}\n${result.text}` : result.text))
-      setOcrNote({ text: result.note, kind: 'ok' })
-    } catch (error) {
-      setOcrNote({ text: describeLlmError(error), kind: 'error' })
-    } finally {
-      setOcrBusy(false)
-    }
-  }
-
   function handleImport(): void {
     const rows = drafts
       .filter((row) => row.name.trim() && row.weekday >= 1 && row.weekday <= 7)
@@ -212,7 +179,7 @@ export function ImportTimetableDialog({ open, busy = false, onCancel, onImport }
       <div className="modal modal-wide" onClick={(event) => event.stopPropagation()}>
         <div className="modal-title">导入课表</div>
         <div className="modal-desc">
-          把教务系统的表格整块复制进来，或者按行手写。识别不准的行可以在下面直接改，确认无误再导入。
+          把教务系统的表格整块复制进来，或者按行手写。认不准的行可以在下面直接改，确认无误再导入。
         </div>
 
         <div className="modal-body">
@@ -234,69 +201,20 @@ export function ImportTimetableDialog({ open, busy = false, onCancel, onImport }
                 event.target.value = ''
               }}
             />
-            <button
-              className="btn small primary"
-              onClick={() => imageRef.current?.click()}
-              disabled={ocrBusy || !visionReady}
-              title={visionReady ? '' : '先在设置页填好模型接口和识图模型'}
-            >
-              {ocrBusy ? '识别中…' : '识别课表图片'}
-            </button>
-            <input
-              ref={imageRef}
-              type="file"
-              accept="image/*"
-              style={{ display: 'none' }}
-              onChange={(event) => {
-                const file = event.target.files?.[0]
-                if (file) void handleImage(file)
-                event.target.value = ''
-              }}
-            />
             <button className="btn small" onClick={() => setText('')} disabled={!text}>
               清空
             </button>
             <div className="spacer" />
             <span className="small muted">
-              支持「周一 第1-2节 课程 地点 教师 1-16周」、Tab 分隔的表格，以及课表截图
+              支持「周一 第1-2节 课程 地点 教师 1-16周」，也认 Tab 分隔的表格
             </span>
           </div>
-
-          {!visionReady ? (
-            <div className="notice" style={{ marginBottom: 10 }}>
-              识图要用带视觉的大模型。到设置页填好 API Key 后，把「识图模型」填成 deepseek-flash（DeepSeek 官方视觉模型）或别的视觉型号，就能直接读课表截图。
-            </div>
-          ) : null}
-
-          {ocrNote ? (
-            <div className={`notice ${ocrNote.kind === 'error' ? 'error' : 'ok'}`} style={{ marginBottom: 10 }}>
-              {ocrNote.text}
-            </div>
-          ) : null}
-
-          {imageUrl ? (
-            <div className="ocr-preview">
-              <img src={imageUrl} alt="课表截图" />
-              <button className="btn ghost small" onClick={() => setImageUrl('')}>
-                收起图片
-              </button>
-            </div>
-          ) : null}
 
           <textarea
             className="textarea mono"
             value={text}
             onChange={(event) => setText(event.target.value)}
-            onPaste={(event) => {
-              // 直接往框里贴截图也能识别，比先存成文件再选省一步。
-              const file = Array.from(event.clipboardData?.files ?? []).find((item) =>
-                item.type.startsWith('image/'),
-              )
-              if (!file) return
-              event.preventDefault()
-              void handleImage(file)
-            }}
-            placeholder="把课表贴在这里，或点上面的「识别课表图片」。想看格式就点「填入示例」，那会真的填进内容，不是灰字提示。"
+            placeholder="把课表贴在这里。想看格式就点「填入示例」，那会真的填进内容，不是灰字提示。"
           />
 
           <div className="row wrap" style={{ margin: '12px 0' }}>

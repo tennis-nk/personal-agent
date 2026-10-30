@@ -46,39 +46,6 @@ except Exception:  # noqa: BLE001
 CONFIG_PATH = HERE / "config.json"
 LOG_PATH = HERE / "bridge.log"
 
-# 允许经本机助手转发的大模型接口。
-#
-# 为什么需要这个：双击打开的 html 是 file:// 页面，Origin 是 null。
-# 浏览器发 POST + Authorization 之前会先发 OPTIONS 预检，服务商不回
-# Access-Control-Allow-Origin 的话，请求根本发不出去，前端只看到一句
-# 「连不上模型接口」——智谱 open.bigmodel.cn 就是这种情况（实测预检 200 但没有跨域头）。
-# 经这里转发，浏览器只跟 127.0.0.1 说话，跨域就不存在了。
-# 只放行这几个域名，别让它变成任意 URL 的通用代理。
-PROXY_HOSTS = {
-    "api.deepseek.com",
-    "open.bigmodel.cn",
-    "dashscope.aliyuncs.com",
-    "api.moonshot.cn",
-    "api.siliconflow.cn",
-    "ark.cn-beijing.volces.com",
-    "api.openai.com",
-    "openrouter.ai",
-}
-
-# 转发时先直连：这台机器上 HTTP_PROXY 会被一些工具塞进环境变量，
-# 让 urllib 把请求发给代理，表现成「上游 200 但内容为空」这种莫名其妙的结果。
-_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-
-def _open_upstream(request: urllib.request.Request, timeout: int = 300):
-    """先直连，连不上再退到环境变量里的代理试一次。"""
-    try:
-        return _DIRECT.open(request, timeout=timeout)
-    except urllib.error.HTTPError:
-        raise
-    except (urllib.error.URLError, TimeoutError, OSError):
-        return urllib.request.urlopen(request, timeout=timeout)
-
 DEFAULT_CONFIG = {
     "port": 8787,
     "wechat": {
@@ -646,61 +613,6 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _relay(self, target: str) -> None:
-        """把一次 chat/completions 请求原样转给上游，再把响应原样吐回去。
-
-        流式和非流式都不做处理，字节照抄：上游发 SSE 就一路 flush 下去，
-        浏览器那边 readStream 拿到的还是原来的格式。
-        """
-        parsed = urlparse(target)
-        if parsed.scheme != "https" or parsed.hostname not in PROXY_HOSTS:
-            self._send(400, {"ok": False, "error": f"这个地址不允许转发：{target}"})
-            return
-
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            body = self.rfile.read(length) if length > 0 else b""
-        except ValueError:
-            body = b""
-
-        headers = {"Content-Type": self.headers.get("Content-Type", "application/json")}
-        auth = self.headers.get("Authorization")
-        if auth:
-            headers["Authorization"] = auth
-        request = urllib.request.Request(target, data=body, headers=headers, method="POST")
-
-        try:
-            upstream = _open_upstream(request)
-        except urllib.error.HTTPError as error:
-            # 4xx/5xx 也是上游的正常回答，原样交给前端，让它自己按状态码解释（401 是 Key 错）。
-            upstream = error
-        except (urllib.error.URLError, TimeoutError, OSError) as error:
-            log(f"转发失败 {target}：{error}")
-            self._send(502, {"ok": False, "error": f"转发失败：{error}"})
-            return
-
-        try:
-            status = getattr(upstream, "status", None) or getattr(upstream, "code", 200)
-            self.send_response(status)
-            self.send_header("Content-Type", upstream.headers.get("Content-Type", "application/json"))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            # 前端靠这个头判断「是本机助手转发回来的」还是「本机助手自己的报错」。
-            self.send_header("Access-Control-Expose-Headers", "X-Relay")
-            self.send_header("X-Relay", "1")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            while True:
-                chunk = upstream.read(4096)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            # 用户中途关页面/取消，属正常情况，不用记日志。
-            pass
-        finally:
-            upstream.close()
-
     def do_GET(self) -> None:  # noqa: N802
         route = urlparse(self.path)
         query = parse_qs(route.query)
@@ -782,14 +694,6 @@ class Handler(BaseHTTPRequestHandler):
             state = feishu_sdk.login_async()
             log("飞书授权已发起，等用户在飞书确认")
             self._send(200, {"ok": True, **state})
-            return
-
-        if route.path == "/proxy":
-            target = (parse_qs(route.query).get("url") or [""])[0]
-            if not target:
-                self._send(400, {"ok": False, "error": "用法：POST /proxy?url=https://api.example.com/v1/chat/completions"})
-                return
-            self._relay(target)
             return
 
         if route.path == "/quit":

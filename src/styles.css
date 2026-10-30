@@ -1531,22 +1531,6 @@ select {
   margin-bottom: 12px;
 }
 
-.ocr-preview {
-  display: flex;
-  gap: 10px;
-  align-items: flex-start;
-  margin-bottom: 10px;
-}
-
-.ocr-preview img {
-  max-width: 100%;
-  max-height: 180px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: #fff;
-  object-fit: contain;
-}
-
 .slot-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(196px, 1fr));
