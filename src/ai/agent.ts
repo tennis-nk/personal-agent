@@ -279,6 +279,72 @@ const QA_SYSTEM =
   '只依据提供的资料片段作答；资料里没有的内容要直说「资料里没有记录」，不要编造。' +
   '回答用中文，先给结论，再列依据。引用依据时用 [1] [2] 标注对应的资料编号。'
 
+const ADVICE_SYSTEM =
+  '你是用户的个人信息管家，负责安排他接下来该做什么。' +
+  '你会同时拿到两类材料：资料片段（编号 [1] [2] …）和待办清单（编号 T1 T2 …）。' +
+  '两类都要看：待办说明已经承诺了什么，资料说明背景与来龙去脉，' +
+  '只看一边会漏事——比如资料里写了作业内容但还没建待办，或待办挂着却早过了截止日。' +
+  '给出接下来最该先做的三件事，每条一句话说清理由，并标注依据（[1] 或 T3）。' +
+  '两者冲突时以截止日期更近的为准。没记录的内容不要编造。回答用中文，不要写套话。'
+
+/**
+ * 行动建议的提示词：资料与待办一起给。
+ *
+ * 以前只喂资料，模型嘴里说「根据这些资料与待办」，实际压根没见过待办，
+ * 于是建议常常和待办清单对不上。这里两边都摆出来，让它自己对照。
+ */
+export function buildAdviceMessages(notes: NoteRow[], todos: TodoRow[], today: string): ChatMessage[] {
+  const picked = rankNotes(notes, '进展 待办 下一步 计划 作业 截止', 6)
+  const noteBlock = picked.length
+    ? picked
+        .map(
+          (note, index) =>
+            `[${index + 1}] 《${defang(note.title)}》\n${defang(
+              `${note.summary ?? ''}\n${note.content}`.trim().slice(0, 900),
+            )}`,
+        )
+        .join('\n\n')
+    : '（资料库里还没有资料）'
+
+  // 待办按「逾期 → 高优先级 → 有截止日 → 其余」排，最多 15 条，够模型看清全貌又不至于塞满。
+  const open = todos.filter((todo) => todo.status !== 'done')
+  const overdueFirst = [...open].sort((a, b) => {
+    const aOver = a.due_date !== null && a.due_date < today
+    const bOver = b.due_date !== null && b.due_date < today
+    if (aOver !== bOver) return aOver ? -1 : 1
+    const weight = (todo: TodoRow) => (todo.priority === 'high' ? 0 : todo.priority === 'medium' ? 1 : 2)
+    if (weight(a) !== weight(b)) return weight(a) - weight(b)
+    return (a.due_date ?? '9999').localeCompare(b.due_date ?? '9999')
+  })
+  const listed = overdueFirst.slice(0, 15)
+  const todoBlock = listed.length
+    ? listed
+        .map((todo) => {
+          const bits: string[] = []
+          if (todo.due_date) {
+            bits.push(todo.due_date < today ? `已逾期（原定 ${todo.due_date}）` : `${todo.due_date} 截止`)
+          } else {
+            bits.push('无截止日期')
+          }
+          bits.push(todo.priority === 'high' ? '高优先级' : todo.priority === 'medium' ? '中优先级' : '低优先级')
+          if (todo.category) bits.push(todo.category)
+          return `T${todo.id} ${defang(todo.title)}（${bits.join(' · ')}）`
+        })
+        .join('\n')
+    : '（没有未完成的待办）'
+
+  return [
+    { role: 'system', content: ADVICE_SYSTEM },
+    {
+      role: 'user',
+      content:
+        `今天是 ${today}。\n\n我的资料片段：\n\n${noteBlock}\n\n` +
+        `我的待办：\n\n${todoBlock}\n\n` +
+        '问题：综合上面两类，我接下来最该先做哪三件事？每条一句话说清理由，并标注依据。',
+    },
+  ]
+}
+
 export function buildQaMessages(question: string, chunks: QaContextChunk[]): ChatMessage[] {
   const context = chunks
     .map((chunk) => `[${chunk.index}] 《${defang(chunk.title)}》\n${defang(chunk.body)}`)

@@ -9,6 +9,7 @@ import { AskPage } from './pages/AskPage'
 import { ReportsPage } from './pages/ReportsPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { ToastProvider, useToast } from './components/Toast'
+import { PlanDialog, type PlanPayload } from './components/PlanDialog'
 import { StoreProvider, useStore } from './store'
 import { courseOccursOn, suggestSemesterStart } from './schedule/occurrence'
 import { today } from './utils/date'
@@ -144,8 +145,32 @@ function ModeBadge() {
 
 function Shell() {
   const [route, setRoute] = useState<RouteKey>(() => readRoute())
-  const { refresh } = useStore()
+  const { courses, addTodo, refresh } = useStore()
   const toast = useToast()
+  /**
+   * 一键安排放在这一层，首页和日历页共用同一个弹窗。
+   * 通知本来就不分「属于哪个页面」，写进日历和待办的路径也只有一条。
+   */
+  const [planOpen, setPlanOpen] = useState(false)
+
+  async function handlePlanApply(payloads: PlanPayload[], source: string): Promise<void> {
+    let count = 0
+    let pending = 0
+    for (const payload of payloads) {
+      try {
+        await addTodo(payload.todo)
+        if (payload.decision === 'later') pending += 1
+        else count += 1
+      } catch {
+        // 单条写失败不影响其他条，最后报总数时会少一条，用户能看出来。
+      }
+    }
+    setPlanOpen(false)
+    const parts: string[] = []
+    if (count > 0) parts.push(`${count} 条已排进日历`)
+    if (pending > 0) parts.push(`${pending} 条挂在待办里等你定`)
+    toast(parts.length > 0 ? `${parts.join('，')}（来源：${source}）。` : '一条都没写入。', parts.length > 0 ? 'ok' : 'error')
+  }
 
   // 光重读数据是不会把错位的课表变出来的。刷新后如果今天一节都排不上，
   // 直接把原因说出来，别让人对着空日历反复点按钮。
@@ -231,8 +256,10 @@ function Shell() {
           <div className={`content-inner${route === 'calendar' ? ' wide' : ''}`}>
             <StorageAlert />
             <StoreAlert />
-            {route === 'dashboard' ? <DashboardPage onNavigate={navigate} /> : null}
-            {route === 'calendar' ? <CalendarPage /> : null}
+            {route === 'dashboard' ? (
+              <DashboardPage onNavigate={navigate} onOpenPlan={() => setPlanOpen(true)} />
+            ) : null}
+            {route === 'calendar' ? <CalendarPage onOpenPlan={() => setPlanOpen(true)} /> : null}
             {route === 'notes' ? <NotesPage /> : null}
             {route === 'todos' ? <TodosPage /> : null}
             {route === 'ask' ? <AskPage /> : null}
@@ -241,6 +268,13 @@ function Shell() {
           </div>
         </div>
       </main>
+
+      <PlanDialog
+        open={planOpen}
+        courses={courses}
+        onClose={() => setPlanOpen(false)}
+        onApply={(payloads, source) => void handlePlanApply(payloads, source)}
+      />
     </div>
   )
 }

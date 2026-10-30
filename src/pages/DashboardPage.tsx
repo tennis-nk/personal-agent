@@ -1,15 +1,15 @@
 import { useMemo, useState } from 'react'
-import {
-  adviseOffline,
-  isModelReady,
-  rankNotes,
-  streamChat,
-  buildQaMessages,
-} from '../ai/agent'
+import { adviseOffline, buildAdviceMessages, isModelReady, streamChat } from '../ai/agent'
 import { useStore } from '../store'
 import { daysBetween, formatDateTime, shiftDays, today } from '../utils/date'
 
-export function DashboardPage({ onNavigate }: { onNavigate: (route: string) => void }) {
+interface Props {
+  onNavigate: (route: string) => void
+  /** 打开一键安排。日历页也有同一个入口，两边共用弹窗。 */
+  onOpenPlan: () => void
+}
+
+export function DashboardPage({ onNavigate, onOpenPlan }: Props) {
   const { notes, todos, loading, error, patchTodo } = useStore()
   const now = today()
 
@@ -60,17 +60,10 @@ export function DashboardPage({ onNavigate }: { onNavigate: (route: string) => v
     setAdviceState('正在分析…')
     setAdvice('')
     try {
-      const picked = rankNotes(notes, '进展 待办 下一步', 6)
       const answer = await streamChat({
-        messages: buildQaMessages(
-          '根据这些资料与待办，我接下来最该先做哪三件事？每条一句话说清理由。',
-          picked.map((note, index) => ({
-            index: index + 1,
-            noteId: note.id,
-            title: note.title,
-            body: `${note.summary ?? ''}\n${note.content}`.trim().slice(0, 900),
-          })),
-        ),
+        // 资料与待办一起喂：只给资料的话，模型嘴上说「根据资料与待办」，
+        // 其实没见过待办，建议和待办清单对不上。
+        messages: buildAdviceMessages(notes, todos, now),
         temperature: 0.4,
         // 没接模型时按逾期、优先级、截止日排序给建议，不假装是模型推理。
         offlineFallback: () => adviseOffline(notes, todos),
@@ -110,6 +103,24 @@ export function DashboardPage({ onNavigate }: { onNavigate: (route: string) => v
 
       {error ? <div className="notice error">{error}</div> : null}
       {loading && notes.length === 0 ? <div className="notice">正在读取本地数据…</div> : null}
+
+      <div className="card">
+        <div className="card-head">
+          <div className="card-title">一键安排</div>
+          <div className="card-head-right">
+            <button className="btn small primary" onClick={onOpenPlan}>
+              开始安排
+            </button>
+          </div>
+        </div>
+        <div className="card-body">
+          <div className="small muted">
+            读微信/飞书最近几天的通知（或整段粘贴进来），按你填的身份筛一遍：
+            参加的直接进日历，拿不准的挂进待办，别人的事和闲聊不占位置。
+            没开本机助手也能用，直接粘贴就行。
+          </div>
+        </div>
+      </div>
 
       <div className="card">
         <div className="card-head">
@@ -166,7 +177,7 @@ export function DashboardPage({ onNavigate }: { onNavigate: (route: string) => v
             <>
               <div className="small muted">
                 {ready
-                  ? '让 AI 通读你的资料与待办，给出接下来最该做的三件事。'
+                  ? '让 AI 同时看你的资料与未完成待办（逾期的排在最前），给出接下来最该做的三件事。'
                   : '未接入模型，将按逾期、优先级与截止日给出本地排序建议。'}
               </div>
               {ready ? null : (

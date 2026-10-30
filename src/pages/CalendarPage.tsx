@@ -1,7 +1,6 @@
 import { useMemo, useState } from 'react'
 import { ImportTimetableDialog, type ImportRow } from '../components/ImportTimetableDialog'
 import { MiniCalendar } from '../components/MiniCalendar'
-import { PlanDialog, type PlanPayload } from '../components/PlanDialog'
 import { TodoEditor, type TodoDraft } from '../components/TodoEditor'
 import { ConfirmDialog } from '../components/ConfirmDialog'
 import { useToast } from '../components/Toast'
@@ -43,7 +42,7 @@ function shortDate(date: string): string {
   return `${parts[1]}月${parts[2]}日`
 }
 
-export function CalendarPage() {
+export function CalendarPage({ onOpenPlan }: { onOpenPlan: () => void }) {
   const { todos, courses, addTodo, patchTodo, removeTodo, importCourses, rescheduleCourses, removeCourse } = useStore()
   const toast = useToast()
 
@@ -61,7 +60,6 @@ export function CalendarPage() {
   const [importOpen, setImportOpen] = useState(false)
   const [importing, setImporting] = useState(false)
   const [pendingCourse, setPendingCourse] = useState<number | null>(null)
-  const [planOpen, setPlanOpen] = useState(false)
 
   const categories = useMemo(
     () => Array.from(new Set(todos.map((todo) => todo.category ?? '未分类'))),
@@ -252,28 +250,6 @@ export function CalendarPage() {
     }
   }
 
-  async function handlePlanApply(payloads: PlanPayload[], source: string): Promise<void> {
-    let count = 0
-    let pending = 0
-    for (const payload of payloads) {
-      try {
-        await addTodo(payload.todo)
-        if (payload.decision === 'later') pending += 1
-        else count += 1
-      } catch {
-        // 单条写失败不影响其他条，最后报总数时会少一条，用户能看出来。
-      }
-    }
-    setPlanOpen(false)
-    const parts: string[] = []
-    if (count > 0) parts.push(`${count} 条已排进日历`)
-    if (pending > 0) parts.push(`${pending} 条挂在待办里等你定`)
-    toast(
-      parts.length > 0 ? `${parts.join('，')}（来源：${source}）。` : '一条都没写入。',
-      parts.length > 0 ? 'ok' : 'error',
-    )
-  }
-
   async function confirmRemoveCourse(): Promise<void> {
     if (pendingCourse === null) return
     try {
@@ -373,7 +349,7 @@ export function CalendarPage() {
           </div>
           <div className="cal-title">{title}</div>
           <div className="spacer" />
-          <button className="btn small primary" onClick={() => setPlanOpen(true)}>
+          <button className="btn small primary" onClick={onOpenPlan}>
             一键安排
           </button>
           <div className="cal-views">
@@ -519,13 +495,6 @@ export function CalendarPage() {
         danger
         onConfirm={() => void confirmRemoveCourse()}
         onCancel={() => setPendingCourse(null)}
-      />
-
-      <PlanDialog
-        open={planOpen}
-        courses={courses}
-        onClose={() => setPlanOpen(false)}
-        onApply={(payloads, source) => void handlePlanApply(payloads, source)}
       />
     </div>
   )
