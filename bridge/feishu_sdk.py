@@ -487,36 +487,56 @@ def _flatten_post(payload: dict) -> str:
 LOGIN: dict = {"state": "idle", "url": "", "error": ""}
 
 
-def login_async() -> dict:
-    """在后台跑一次设备码授权，立刻返回；进度看 LOGIN。"""
+def login_async(wait_url: float = 10.0) -> dict:
+    """在后台跑一次设备码授权，立刻返回；进度看 LOGIN。
+
+    申请验证链接要跑一趟网络，一两秒后才写进 LOGIN。以前接口立刻返回，
+    拿到的 url 是空的，前端当场显示「授权失败」——用户的感受就是按钮没反应，
+    得再点一次。这里等链接就位（或请求明确出错）再回。
+    """
     if LOGIN.get("state") == "pending":
-        return dict(LOGIN)
-    LOGIN.update(state="pending", url="", error="")
+        state = dict(LOGIN)
+        if state.get("url"):
+            return state
+        # 还在等第一次返回，给它一点时间；下面这段同样会等。
+    else:
+        LOGIN.update(state="pending", url="", error="")
 
-    def on_url(url: str, expire_in: int) -> None:
-        LOGIN.update(url=url, expire_in=expire_in)
+        def on_url(url: str, expire_in: int) -> None:
+            LOGIN.update(url=url, expire_in=expire_in)
 
-    def run() -> None:
-        try:
-            device_login(on_url=on_url)
-            LOGIN.update(state="ok")
-        except SystemExit as error:
-            LOGIN.update(state="error", error=str(error))
-        except Exception as error:  # noqa: BLE001
-            LOGIN.update(state="error", error=f"{type(error).__name__}: {error}")
+        def run() -> None:
+            try:
+                device_login(on_url=on_url)
+                LOGIN.update(state="ok")
+            except SystemExit as error:
+                LOGIN.update(state="error", error=str(error))
+            except Exception as error:  # noqa: BLE001
+                LOGIN.update(state="error", error=f"{type(error).__name__}: {error}")
 
-    threading.Thread(target=run, daemon=True, name="feishu-login").start()
+        threading.Thread(target=run, daemon=True, name="feishu-login").start()
+
+    deadline = time.monotonic() + max(0.0, wait_url)
+    while time.monotonic() < deadline:
+        if LOGIN.get("url") or LOGIN.get("error"):
+            break
+        time.sleep(0.1)
     return dict(LOGIN)
 
 
 def status() -> dict:
     auth = load_auth()
     now = int(time.time())
+    token = auth.get("access_token") or ""
+    expires_in = max(0, int(auth.get("expires_at", 0)) - now)
+    # 有 token 不等于能用：过期了就该当没授权，否则界面会显示「已授权」但一条消息都读不到。
+    usable = bool(token) and expires_in > 60
     return {
         "app_ready": bool(auth.get("client_id")),
         "client_id": auth.get("client_id", ""),
-        "logged_in": bool(auth.get("access_token")),
-        "expires_in": max(0, int(auth.get("expires_at", 0)) - now),
+        "logged_in": usable,
+        "expired": bool(token) and not usable,
+        "expires_in": expires_in,
         "has_refresh": bool(auth.get("refresh_token")),
         "scope": auth.get("scope", ""),
         "login": dict(LOGIN),

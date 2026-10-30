@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { isModelReady } from '../ai/agent'
 import { describeLlmError, testConnection } from '../ai/llm'
 import {
@@ -59,6 +59,66 @@ function upsertSender(text: string, group: string, sender: string): string {
   people.push(sender)
   lines[index] = `${name.trim()}|${people.join(',')}`
   return lines.join('\n')
+}
+
+/**
+ * 会话名太多（微信能读到一百多个），一个搜索框比把名字摊一屏好用。
+ * 多于 SHOWN 条就分页，免得一次渲染几百个按钮把页面拖慢。
+ */
+function SessionPicker({ names, onPick }: { names: string[]; onPick: (name: string) => void }) {
+  const SHOWN = 40
+  const [keyword, setKeyword] = useState('')
+  const [page, setPage] = useState(0)
+  const filtered = useMemo(() => {
+    const key = keyword.trim()
+    if (!key) return names
+    return names.filter((name) => name.includes(key))
+  }, [names, keyword])
+  const pages = Math.max(1, Math.ceil(filtered.length / SHOWN))
+  const start = Math.min(page, pages - 1) * SHOWN
+  const shown = filtered.slice(start, start + SHOWN)
+
+  return (
+    <>
+      {names.length > SHOWN ? (
+        <input
+          className="input"
+          style={{ marginTop: 6 }}
+          value={keyword}
+          placeholder={`在 ${names.length} 个会话里搜名字`}
+          onChange={(event) => {
+            setKeyword(event.target.value)
+            setPage(0)
+          }}
+        />
+      ) : null}
+      <div className="row wrap" style={{ marginTop: 6, gap: 6 }}>
+        {shown.map((name) => (
+          <button key={name} className="btn small" onClick={() => onPick(name)}>
+            {name}
+          </button>
+        ))}
+        {filtered.length === 0 ? <span className="small muted">没有匹配的名字</span> : null}
+      </div>
+      {pages > 1 ? (
+        <div className="row" style={{ marginTop: 6, gap: 8, alignItems: 'center' }}>
+          <button className="btn small" disabled={start === 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>
+            上一页
+          </button>
+          <span className="small muted">
+            第 {start + 1}–{Math.min(start + SHOWN, filtered.length)} 个，共 {filtered.length} 个
+          </span>
+          <button
+            className="btn small"
+            disabled={start + SHOWN >= filtered.length}
+            onClick={() => setPage((p) => Math.min(pages - 1, p + 1))}
+          >
+            下一页
+          </button>
+        </div>
+      ) : null}
+    </>
+  )
 }
 
 function SpeakerPicker({
@@ -763,13 +823,7 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
             {sessionPool.length > 0 ? (
               <div style={{ marginTop: 10 }}>
                 <div className="small muted">点一下就加进上面的输入框：</div>
-                <div className="row wrap" style={{ marginTop: 6, gap: 6 }}>
-                  {sessionPool.slice(0, 24).map((name) => (
-                    <button key={name} className="btn small" onClick={() => addSession(name)}>
-                      {name}
-                    </button>
-                  ))}
-                </div>
+                <SessionPicker names={sessionPool} onPick={(name) => addSession(name)} />
               </div>
             ) : null}
 
@@ -865,13 +919,7 @@ export function SettingsPage({ onChanged }: { onChanged: () => void }) {
                 {feishuPool.length > 0 ? (
                   <div style={{ marginTop: 10 }}>
                     <div className="small muted">点一下就加进上面的输入框：</div>
-                    <div className="row wrap" style={{ marginTop: 6, gap: 6 }}>
-                      {feishuPool.slice(0, 24).map((name) => (
-                        <button key={name} className="btn small" onClick={() => addFeishuChat(name)}>
-                          {name}
-                        </button>
-                      ))}
-                    </div>
+                    <SessionPicker names={feishuPool} onPick={(name) => addFeishuChat(name)} />
                   </div>
                 ) : null}
 

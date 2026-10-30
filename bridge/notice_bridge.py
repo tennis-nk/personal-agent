@@ -82,9 +82,20 @@ TIME_PATTERN = re.compile(r"(\d{1,2}):(\d{2})")
 WEEKDAY_NAMES = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
 
 
+# 终端输出可能是个已经断掉的管道（被人用 `| head` 截过、或控制台窗口已关）。
+# 写不出去是小事，绝不能因为它把请求处理线程炸掉——一旦炸掉，每个请求都在
+# 返回响应前断开，整个助手看着就像「所有功能都失效」。断过一次就不再往终端写。
+_stdout_broken = False
+
+
 def log(message: str) -> None:
+    global _stdout_broken
     line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
-    print(line, flush=True)
+    if not _stdout_broken:
+        try:
+            print(line, flush=True)
+        except (OSError, ValueError):
+            _stdout_broken = True
     try:
         with LOG_PATH.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
@@ -350,41 +361,107 @@ def sender_hit(sender: str, wanted: list[str]) -> bool:
     return False
 
 
+SESSION_NOISE = {"折叠的聊天", "服务号", "订阅号", "微信团队", "文件传输助手", "微信支付", "微信游戏"}
+# 会话列表一次取一屏，往下滚到底最多也用不了太多屏；留个上限防止滚动异常情况卡很久。
+SESSION_SCROLL_LIMIT = 60
+
+
+def _session_names(wx) -> list[str]:
+    """从当前这一屏会话里取名字。"""
+    names: list[str] = []
+    for item in wx.GetSession() or []:
+        value = None
+        for attr in ("name", "Name", "nickname", "remark"):
+            candidate = getattr(item, attr, None)
+            if isinstance(candidate, str) and candidate.strip():
+                value = candidate.strip()
+                break
+        if value is None:
+            info = getattr(item, "info", None)
+            if isinstance(info, dict):
+                candidate = info.get("name") or info.get("nickname")
+                if isinstance(candidate, str) and candidate.strip():
+                    value = candidate.strip()
+        if value:
+            names.append(value)
+    return names
+
+
 def list_wechat_sessions() -> tuple[list[str], str]:
-    """列出微信会话名，省得用户手打群名。微信没开就返回空。"""
+    """列出微信会话名，省得用户手打群名。微信没开就返回空。
+
+    微信的会话列表是一次只渲染一屏的虚拟列表，直接 GetSession() 只能拿到屏幕上那十来条，
+    要填白名单的群多半在下面根本找不到。所以这里边往下滚边收，滚到底为止。
+    """
 
     def job() -> list[str]:
-        wx = wx_instance()
-        return list(wx.GetSession() or [])
+        import time
 
+        wx = wx_instance()
+        wx.SwitchToChat()
+        box = getattr(wx, "SessionBox", None)
+        if box is not None:
+            try:
+                box.go_top()
+                time.sleep(0.3)
+            except Exception as error:  # noqa: BLE001
+                log(f"会话列表回到顶部失败：{error}")
+
+        names: list[str] = []
+        seen: set[str] = set()
+
+        def collect() -> int:
+            added = 0
+            for name in _session_names(wx):
+                if name in seen:
+                    continue
+                seen.add(name)
+                names.append(name)
+                added += 1
+            return added
+
+        collect()
+        stale = 0
+        if box is not None:
+            for _ in range(SESSION_SCROLL_LIMIT):
+                try:
+                    box.roll_down()
+                except Exception as error:  # noqa: BLE001
+                    log(f"会话列表滚动失败：{error}")
+                    break
+                time.sleep(0.25)
+                if collect() == 0:
+                    stale += 1
+                    # 连着两屏都没新名字，基本到底了；连续失败也别空耗。
+                    if stale >= 2:
+                        break
+                else:
+                    stale = 0
+            # 滚完回到顶部，别把用户的会话列表留在半中间。
+            try:
+                box.go_top()
+            except Exception:  # noqa: BLE001
+                pass
+        return names
+
+    shown, why = show_wechat()
+    if not shown:
+        return [], f"读不了会话名：{why}"
     try:
-        raw = wx_call(job, timeout=25)
+        raw = wx_call(job, timeout=180)
     except WxMissing as error:
         return [], str(error)
     except Exception as error:  # noqa: BLE001
         return [], f"读会话列表失败：{error}"
+    finally:
+        # 读完收回去，别让微信一直占着屏幕（config 里 wechat.auto_hide 设 false 可以留着不收）。
+        if load_config().get("wechat", {}).get("auto_hide", True):
+            hide_wechat()
 
-    names: list[str] = []
-    for item in raw:
-        for attr in ("name", "Name", "nickname", "remark"):
-            value = getattr(item, attr, None)
-            if isinstance(value, str) and value.strip():
-                names.append(value.strip())
-                break
-        else:
-            info = getattr(item, "info", None)
-            if isinstance(info, dict):
-                value = info.get("name") or info.get("nickname")
-                if isinstance(value, str) and value.strip():
-                    names.append(value.strip())
+    if not raw:
+        return [], "会话列表是空的：确认微信已经登录并停在聊天页"
     # 去重、保序，顺手滤掉界面上的固定条目（不是会话）
-    noise = {"折叠的聊天", "服务号", "订阅号", "微信团队", "文件传输助手"}
-    seen: set[str] = set()
-    unique = [
-        name
-        for name in names
-        if name not in noise and not (name in seen or seen.add(name))
-    ]
+    unique = [name for name in raw if name not in SESSION_NOISE]
     return unique, ""
 
 
@@ -587,6 +664,28 @@ def wechat_hwnd() -> int:
     return found[0] if found else 0
 
 
+def open_in_browser(url: str) -> bool:
+    """用系统默认浏览器打开一个链接。
+
+    只放 accounts.feishu.cn 这一处：本地服务虽然只监听 127.0.0.1，
+    但开放「任意 URL」给浏览器打开，等于给本机留一条任意跳转的口子，
+    没必要。校验不过就返回失败，前端照旧把链接显示出来让用户自己点。
+    """
+    if not url:
+        return False
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname != "accounts.feishu.cn":
+        log(f"拒绝打开非飞书授权链接：{parsed.scheme}://{parsed.hostname}")
+        return False
+    try:
+        import webbrowser
+
+        return bool(webbrowser.open(url))
+    except Exception as error:  # noqa: BLE001
+        log(f"打开浏览器失败：{error}")
+        return False
+
+
 def show_wechat() -> tuple[bool, str]:
     """读之前把微信从任务栏（或托盘）里放出来。
 
@@ -772,7 +871,32 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _fail(self, message: str) -> None:
+        """路由里出岔子时的兜底：宁可回一个看不懂的 JSON，也别把连接掐断。
+
+        掐断连接的后果很重——前端收不到任何响应，界面上表现为「功能失效」，
+        而日志里可能只有一句没人看的 traceback。这里统一记下来并回 500。
+        """
+        try:
+            self._send(500, {"ok": False, "error": message})
+        except Exception:  # noqa: BLE001
+            pass
+
     def do_GET(self) -> None:  # noqa: N802
+        try:
+            self.route_get()
+        except Exception:  # noqa: BLE001
+            log("GET 处理出错：\n" + traceback.format_exc())
+            self._fail("服务端处理出错，详见 bridge.log")
+
+    def do_POST(self) -> None:  # noqa: N802
+        try:
+            self.route_post()
+        except Exception:  # noqa: BLE001
+            log("POST 处理出错：\n" + traceback.format_exc())
+            self._fail("服务端处理出错，详见 bridge.log")
+
+    def route_get(self) -> None:
         route = urlparse(self.path)
         query = parse_qs(route.query)
 
@@ -814,6 +938,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"chats": [], "error": str(error) or "读取失败"})
             return
 
+        if route.path == "/feishu/open":
+            # 网页里 window.open 在 file:// 下常被拦；交给本机脚本开默认浏览器更稳。
+            target = (query.get("url") or [""])[0].strip()
+            opened = open_in_browser(target)
+            self._send(200, {"ok": opened, "url": target})
+            return
+
         if route.path == "/activate":
             app = (query.get("app") or ["feishu"])[0]
             keyword = "微信" if app == "wechat" else self.config.get("feishu", {}).get("window", "飞书")
@@ -842,7 +973,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._send(404, {"error": "not found"})
 
-    def do_POST(self) -> None:  # noqa: N802
+    def route_post(self) -> None:
         """只开放几个安全字段，端口改动也要落盘，避免下次启动又变回去。"""
         route = urlparse(self.path)
 
@@ -915,14 +1046,21 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"ok": True, "config": config})
 
     def do_OPTIONS(self) -> None:  # noqa: N802
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Accept, Content-Type, Authorization")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.end_headers()
+        try:
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Accept, Content-Type, Authorization")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.end_headers()
+        except Exception:  # noqa: BLE001
+            pass
 
     def log_message(self, fmt: str, *args) -> None:
-        log(fmt % args)
+        # 每个请求都要记一行。以前这行的输出失败会把请求一起带走，现在 log 自己吞掉了。
+        try:
+            log(fmt % args)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 _SERVER: "ThreadingHTTPServer | None" = None
@@ -956,7 +1094,10 @@ def main() -> int:
 
     port = int(config.get("port", 8787))
     Handler.config = config
+    # daemon_threads：请求线程不能拖住进程退出。
+    # 每个请求再单独兜一层，任何异常都回 JSON（见 Handler.do_GET）。
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server.daemon_threads = True
     _SERVER = server
     log(f"本机助手已启动：http://127.0.0.1:{port}/today")
     log(f"配置文件：{CONFIG_PATH}")

@@ -236,6 +236,26 @@ export async function startFeishuLogin(config: BridgeConfig): Promise<{ ok: bool
 }
 
 /**
+ * 让本机助手用默认浏览器打开飞书授权页。
+ *
+ * 网页自己开新窗口在 file:// 下常被拦掉，交给本机脚本更稳。失败也不用管，
+ * 界面上链接照旧显示着，手动点是一样的。
+ */
+export async function openFeishuAuth(config: BridgeConfig, url: string): Promise<boolean> {
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${config.port}/feishu/open?url=${encodeURIComponent(url)}`,
+      { headers: { Accept: 'application/json' }, cache: 'no-store' },
+    )
+    if (!response.ok) return false
+    const data = (await response.json()) as { ok?: boolean }
+    return Boolean(data.ok)
+  } catch {
+    return false
+  }
+}
+
+/**
  * 让本机助手把微信/飞书窗口弹到前台。
  *
  * 网页自己唤不起客户端（URL scheme 不一定注册了），交给本机脚本更稳。

@@ -9,6 +9,7 @@ import {
   loadBridge,
   loadProfile,
   loadRemoteBridge,
+  openFeishuAuth,
   recordSpeakers,
   saveBridge,
   startFeishuLogin,
@@ -201,13 +202,16 @@ export function PlanDialog({ open, courses, onClose, onApply }: Props) {
         )
         return
       }
+      const opened = await openFeishuAuth(bridge, result.url)
       setFeishuAuth((prev) =>
         prev
           ? {
               ...prev,
               busy: false,
               url: result.url,
-              message: '用飞书扫下面的二维码，或在浏览器里打开链接确认。确认后这里会自动消失。',
+              message: opened
+                ? '已经用默认浏览器打开授权页，在里面点「确认授权」就行。确认后这条提示会自动消失。'
+                : '浏览器没能自动打开，点下面的链接过去确认。确认后这条提示会自动消失。',
             }
           : prev,
       )
